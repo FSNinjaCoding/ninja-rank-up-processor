@@ -8,7 +8,8 @@ import re
 # --- CONFIGURATION ---
 GOOGLE_SHEET_NAME = "Ninja_Rank_Up_Output"
 
-st.set_page_config(page_title="Ninja Rank Up Processor 2.0", page_icon="⭐", layout="wide")
+# VERSION UPDATE: 2.1
+st.set_page_config(page_title="Ninja Rank Up Processor 2.1", page_icon="⭐", layout="wide")
 
 # --- HELPER FUNCTIONS ---
 
@@ -98,7 +99,7 @@ def parse_roll_sheet(html_content):
             
             # Extract Level (e.g. "s2")
             skill_level = 0
-            skill_match = re.search(r's([0-9]|10)\b', details_text)
+            skill_match = re.search(r'\bs([0-9]|10)\b', details_text)
             if skill_match: 
                 skill_level = int(skill_match.group(1))
             
@@ -173,16 +174,13 @@ def parse_skill_evals_v2(html_content):
         
         # Look for table's overarching level in nearby text
         table_level = None
-        curr = table.previous_element
-        count = 0
-        while curr and count < 50:
-            if isinstance(curr, str) and curr.strip():
-                match = re.search(r'\b(?:stage|level|s)[-\s]?0*(\d+)\b', curr.strip(), re.IGNORECASE)
-                if match:
-                    table_level = int(match.group(1))
-                    break
-            curr = curr.previous_element
-            count += 1
+        prev_tags = table.find_all_previous(['h1', 'h2', 'h3', 'h4', 'div', 'b', 'strong', 'span'])
+        for tag in prev_tags:
+            text = tag.get_text(separator=" ", strip=True)
+            match = re.search(r'\b(?:stage|level|s)\s*0*(\d+)\b', text, re.IGNORECASE)
+            if match:
+                table_level = int(match.group(1))
+                break
             
         for row in rows[1:]:
             cols = [c for c in row.find_all(['td', 'th']) if c.find_parent('tr') == row]
@@ -197,7 +195,7 @@ def parse_skill_evals_v2(html_content):
                 row_level = int(lvl_match.group(1))
                 
             if row_level is None:
-                continue # We skip scores if we can't identify what stage they belong to
+                continue # Skip scores if we can't identify what stage they belong to
                 
             scores = cols[1:] 
             for idx, s_name in enumerate(students):
@@ -216,6 +214,7 @@ def parse_skill_evals_v2(html_content):
                         student_evals[s_name][row_level] = {'total': 0, 'incomplete': 0}
                         
                     student_evals[s_name][row_level]['total'] += 1
+                    # Less than a 3 means the skill is incomplete
                     if score < 3:
                         student_evals[s_name][row_level]['incomplete'] += 1
                         
@@ -258,7 +257,7 @@ def export_to_google_sheets(df):
 
 # --- MAIN UI ---
 
-st.title("⭐ Ninja Rank Up Processor 2.0")
+st.title("⭐ Ninja Rank Up Processor 2.1")
 st.write("Upload all three files to cross-reference a student's **Current Level** with their **Target Evaluation Scores**.")
 
 col1, col2, col3 = st.columns(3)
