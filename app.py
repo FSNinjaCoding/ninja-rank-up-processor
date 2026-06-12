@@ -8,12 +8,12 @@ import re
 # --- CONFIGURATION ---
 GOOGLE_SHEET_NAME = "Ninja_Rank_Up_Output"
 
-st.set_page_config(page_title="Ninja Rank Up Processor 1.0", page_icon="⭐", layout="wide")
+st.set_page_config(page_title="Ninja Rank Up Processor 1.1", page_icon="⭐", layout="wide")
 
 # --- HELPER FUNCTIONS ---
 
 def clean_name(name):
-    """Standardizes names (Title Case, no extra spaces) for accurate merging."""
+    """Standardizes names (Title Case, no extra spaces)."""
     if not isinstance(name, str): return ""
     clean = re.sub(r'\s+', ' ', name).replace(u'\xa0', ' ').strip()
     return clean.title()
@@ -28,7 +28,7 @@ def abbreviate_class_name(name):
     return name
 
 def parse_class_info(class_name):
-    """Extracts Day and Time for sorting purposes."""
+    """Extracts Day and Time for sorting."""
     if not isinstance(class_name, str) or class_name == "Not Found":
         return "Lost", 9999, ""
     
@@ -51,24 +51,28 @@ def parse_class_info(class_name):
 # --- PARSING LOGIC ---
 
 def parse_student_list(html_content):
-    """Pulls the Student Name and Group Keyword from the Custom Student List HTML."""
     soup = BeautifulSoup(html_content, 'lxml')
     data = []
     tables = soup.find_all('table')
     
     for table in tables:
-        rows = table.find_all('tr')
-        if not rows: continue
-        headers = [c.get_text(strip=True).lower() for c in rows[0].find_all(['td', 'th'])]
+        # Ignore master layout tables that contain other tables
+        if table.find('table'): continue 
         
-        name_idx, key_idx = 1, 4 # Defaults based on standard reports
+        # Only grab rows that belong DIRECTLY to this specific table
+        rows = [r for r in table.find_all('tr') if r.find_parent('table') == table]
+        if not rows: continue
+        
+        headers = [c.get_text(strip=True).lower() for c in rows[0].find_all(['td', 'th']) if c.find_parent('tr') == rows[0]]
+        
+        name_idx, key_idx = 1, 4 
         for i, h in enumerate(headers):
             if "student name" in h: name_idx = i
             elif "keyword" in h: key_idx = i
 
         for row in rows[1:]:
-            cols = row.find_all(['td', 'th'])
-            def get_val(i): return cols[i].get_text(strip=True) if i < len(cols) else ""
+            cols = [c for c in row.find_all(['td', 'th']) if c.find_parent('tr') == row]
+            def get_val(i): return cols[i].get_text(separator=" ", strip=True) if i < len(cols) else ""
             
             raw_name = get_val(name_idx)
             keywords_raw = get_val(key_idx).lower()
@@ -87,56 +91,62 @@ def parse_student_list(html_content):
     return df
 
 def parse_skill_evals(html_content):
-    """Scans the matrix to count incomplete skills for each student."""
     soup = BeautifulSoup(html_content, 'lxml')
     data = []
-    
     tables = soup.find_all('table')
     
     for table in tables:
-        # iClassPro usually places the class name in an element directly preceding the table
-        prev_tag = table.find_previous_sibling(['h2', 'h3', 'div', 'span'])
-        class_name_raw = prev_tag.get_text(strip=True) if prev_tag else "Unknown Class"
+        # Ignore master layout tables
+        if table.find('table'): continue 
+        
+        rows = [r for r in table.find_all('tr') if r.find_parent('table') == table]
+        if len(rows) < 2: continue
+            
+        header_cols = [c for c in rows[0].find_all(['td', 'th']) if c.find_parent('tr') == rows[0]]
+        if len(header_cols) < 2: continue
+            
+        # Walk backward through the HTML tree to find the specific Class Name header
+        class_name_raw = "Unknown Class"
+        curr = table.previous_element
+        while curr:
+            if isinstance(curr, str) and curr.strip():
+                text = curr.strip()
+                # Look for strings containing days/times, OR specific header tags
+                if re.search(r'\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b', text, re.IGNORECASE) and ":" in text:
+                    class_name_raw = text
+                    break
+                if curr.parent and curr.parent.name in ['h2', 'h3', 'h4', 'b', 'strong', 'div']:
+                    if len(text) > 5 and "Printout" not in text and "Evaluation" not in text and "Page" not in text:
+                        class_name_raw = text
+                        break
+            curr = curr.previous_element
+        
         class_name = abbreviate_class_name(class_name_raw)
         
-        rows = table.find_all('tr')
-        if not rows or len(rows) < 2:
-            continue
-            
-        # First row contains the Student Names
-        header_cols = rows[0].find_all(['th', 'td'])
-        if len(header_cols) < 2:
-            continue
-            
+        # Grab cleanly separated student names
         students = []
-        for col in header_cols[1:]: # Skip index 0 (which is the "Skills" label column)
-            students.append(col.get_text(strip=True))
+        for col in header_cols[1:]: 
+            students.append(clean_name(col.get_text(separator=" ", strip=True)))
             
-        # Initialize a dictionary to track how many skills are < 3 for each student
         student_tracker = {name: 0 for name in students if name}
         
-        # Loop through the actual skills rows
+        # Tally the scores
         for row in rows[1:]:
-            cols = row.find_all(['td', 'th'])
-            if len(cols) < 2:
-                continue
+            cols = [c for c in row.find_all(['td', 'th']) if c.find_parent('tr') == row]
+            if len(cols) < 2: continue
                 
-            scores = cols[1:] # The star/number values
-            
+            scores = cols[1:] 
             for idx, name in enumerate(students):
                 if not name: continue
                 if idx < len(scores):
-                    score_text = scores[idx].get_text(strip=True)
-                    
-                    # Extract numeric value. If empty/blank, it counts as 0.
+                    score_text = scores[idx].get_text(separator=" ", strip=True)
                     match = re.search(r'(\d)', score_text)
                     score = int(match.group(1)) if match else 0
                     
-                    # If score is less than 3, it is an incomplete skill row
                     if score < 3:
                         student_tracker[name] += 1
                         
-        # Filter for students with 3 or fewer incomplete skills
+        # Filter logic
         for name, incomplete_count in student_tracker.items():
             if incomplete_count <= 3:
                 if incomplete_count == 0:
@@ -145,7 +155,7 @@ def parse_skill_evals(html_content):
                     status = f"{incomplete_count} Skills Away"
                     
                 data.append({
-                    "Student Name": clean_name(name),
+                    "Student Name": name,
                     "Class Name": class_name,
                     "Incomplete Skills": incomplete_count,
                     "Status": status
@@ -156,7 +166,6 @@ def parse_skill_evals(html_content):
 # --- GOOGLE SHEETS EXPORT ---
 
 def export_to_google_sheets(df):
-    """Pushes a clean, flat list of flagged students to Google Sheets."""
     if "gcp_service_account" not in st.secrets:
         st.error("Secrets not found!")
         return None
@@ -172,7 +181,6 @@ def export_to_google_sheets(df):
         st.error(f"Could not open sheet. Ensure a sheet named '{GOOGLE_SHEET_NAME}' exists and is shared with your service account email. Error: {e}")
         return None
 
-    # Sort data logically: By Day, then Time, then Status
     df = df.sort_values(by=['Sort Day', 'Sort Time', 'Incomplete Skills'])
     export_df = df[["Student Name", "Group", "Class Name", "Status"]]
 
@@ -182,19 +190,16 @@ def export_to_google_sheets(df):
     except gspread.exceptions.WorksheetNotFound:
         ws = ss.add_worksheet(title="Rank Up Flags", rows=100, cols=10)
 
-    # Convert DataFrame to 2D List for Google Sheets
     data_matrix = [export_df.columns.values.tolist()] + export_df.values.tolist()
     
     ws.update(range_name="A1", values=data_matrix)
-    
-    # Simple Header Formatting
     ws.format("A1:D1", {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}})
     
     return f"https://docs.google.com/spreadsheets/d/{ss.id}"
 
 # --- MAIN UI ---
 
-st.title("⭐ Ninja Rank Up Processor 1.0")
+st.title("⭐ Ninja Rank Up Processor 1.1")
 st.write("Upload the **Class Evaluation Form HTML** and the **Custom Student List HTML** to flag students who are 3 or fewer skills away from completing their stage.")
 
 col1, col2 = st.columns(2)
@@ -211,27 +216,22 @@ if file_eval and file_list:
     
     with st.spinner('Parsing Evaluation Matrices...'):
         try:
-            # 1. Parse Data
             df_evals = parse_skill_evals(content_eval)
             df_students = parse_student_list(content_list)
             
             if df_evals.empty:
                 st.warning("⚠️ No students found within 3 skills of ranking up, or unable to read the Evaluation table format.")
             else:
-                # 2. Merge Data
                 merged_df = pd.merge(df_evals, df_students, on="Student Name", how="left")
                 merged_df["Group"] = merged_df["Group"].fillna("Unknown")
                 
-                # 3. Add Sortable Time Columns
                 merged_df[['Sort Day', 'Sort Time', 'Time Str']] = merged_df['Class Name'].apply(
                     lambda x: pd.Series(parse_class_info(x))
                 )
                 
-                # Display Results in Streamlit
                 st.success(f"Found {len(merged_df)} students ready or nearly ready to level up!")
                 st.dataframe(merged_df[["Student Name", "Group", "Class Name", "Status"]], use_container_width=True)
                 
-                # 4. Google Sheets Push
                 if st.button("Update Master Google Sheet", use_container_width=True):
                     link = export_to_google_sheets(merged_df)
                     if link:
