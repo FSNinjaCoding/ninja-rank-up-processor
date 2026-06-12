@@ -1,0 +1,1 @@
+# ninja-rank-up-processor
