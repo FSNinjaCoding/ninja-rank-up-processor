@@ -8,30 +8,30 @@ import re
 # --- CONFIGURATION ---
 GOOGLE_SHEET_NAME = "Ninja_Rank_Up_Output"
 
-# VERSION UPDATE: 3.2
-st.set_page_config(page_title="Ninja Rank Up Processor 3.2", page_icon="⭐", layout="wide")
+# VERSION UPDATE: 4.0
+st.set_page_config(page_title="Ninja Rank Up Processor 4.0", page_icon="⭐", layout="wide")
 
 # --- HELPER FUNCTIONS ---
 
 def clean_name(name):
-    """Standardizes names, fixes commas, and removes numbers/dates."""
+    """Hyper-robust name cleaner to fix iClassPro's mashed formatting."""
     if not isinstance(name, str): return ""
-    clean = re.sub(r'\s+', ' ', name).replace(u'\xa0', ' ').strip()
     
-    # Remove random numbers in parenthesis (e.g. "Lucas Arenhart (7)") 
-    # to ensure it matches exactly across sheets.
-    clean = re.sub(r'\(\d+\)', '', clean).strip()
-
-    if ',' in clean:
-        parts = clean.split(',')
+    # 1. Remove the appended numbers like (1) or (7)
+    name = re.sub(r'\(\d+\)', '', name)
+    
+    # 2. Fix mashed CamelCase names (e.g. "LucasArenhart" -> "Lucas Arenhart")
+    name = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', name)
+    
+    # 3. Fix "Last, First" formatting from Roll Sheets
+    if ',' in name:
+        parts = name.split(',')
         if len(parts) == 2:
-            clean = f"{parts[1].strip()} {parts[0].strip()}"
+            name = f"{parts[1].strip()} {parts[0].strip()}"
             
-    # Sometimes iClassPro mashes names together like "ElijahAbide" in the Eval sheet.
-    # We use a regex trick to insert a space before capital letters (excluding the first).
-    clean = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', clean)
-            
-    return clean.title()
+    # 4. Strip out any weird hidden characters or extra spaces
+    name = re.sub(r'[^a-zA-Z\s\-]', '', name)
+    return re.sub(r'\s+', ' ', name).strip().title()
 
 def abbreviate_class_name(name):
     if not isinstance(name, str): return name
@@ -66,22 +66,29 @@ def extract_digits(val):
     return match.group() if match else ""
 
 def is_skill_incomplete(score_text):
-    score_text = score_text.lower().strip()
-    if not score_text or score_text == "-" or score_text.isspace() or "n/a" in score_text:
+    """Calculates fractions, single digits, and checkmarks."""
+    text = str(score_text).lower().strip()
+    
+    if not text or text == "-" or text.isspace() or "n/a" in text:
         return True
     
-    match_frac = re.search(r'(\d+)\s*/\s*(\d+)', score_text)
+    # 1. Fraction check (e.g. 2/3)
+    match_frac = re.search(r'(\d+)\s*/\s*(\d+)', text)
     if match_frac:
-        return int(match_frac.group(1)) < int(match_frac.group(2))
+        num = int(match_frac.group(1))
+        den = int(match_frac.group(2))
+        return num < den
         
-    match_single = re.search(r'(\d)', score_text)
+    # 2. Single digit check (Isolated digit, assumes 3 is passing)
+    match_single = re.search(r'(?<!/)\b(\d)\b(?!/)', text)
     if match_single:
         return int(match_single.group(1)) < 3
         
-    if any(mark in score_text for mark in ["pass", "✔", "✓", "★", "complete"]):
+    # 3. Checkmarks / Pass text
+    if any(mark in text for mark in ["pass", "✔", "✓", "★", "complete"]):
         return False
         
-    return True
+    return True # Default to incomplete if it's weird text
 
 # --- PARSING LOGIC ---
 
@@ -89,7 +96,6 @@ def parse_roll_sheet(html_content):
     soup = BeautifulSoup(html_content, 'lxml')
     data = []
     headers = soup.find_all('div', class_='full-width-header')
-    
     if not headers: return pd.DataFrame()
 
     for header in headers:
@@ -98,42 +104,29 @@ def parse_roll_sheet(html_content):
         current_class_name = abbreviate_class_name(class_name_raw)
         
         table = header.find_next('table', class_='table-roll-sheet')
-        
         if not table: continue
         rows = table.find_all('tr')
         if not rows: continue
         
         first_row_cols = [c.get_text(strip=True).lower() for c in rows[0].find_all(['td', 'th'])]
-        name_idx, detail_idx = -1, -1 
-        
+        name_idx = -1 
         for idx, col_text in enumerate(first_row_cols):
             if "student" in col_text: name_idx = idx
-            if "details" in col_text: detail_idx = idx
-            
-        if name_idx == -1: name_idx = 1 # Fallback
+        if name_idx == -1: name_idx = 1
             
         for row in rows[1:]:
             cols = row.find_all(['td', 'th'])
             if len(cols) <= name_idx: continue
                 
-            raw_name = cols[name_idx].get_text(separator=" ", strip=True)
-            
-            # The name column often contains random stuff. We just want the bold text or the first line.
-            strong_tag = cols[name_idx].find('strong')
-            if strong_tag:
-                raw_name = strong_tag.get_text(strip=True)
-            else:
-                raw_name = raw_name.split('\n')[0].strip()
-
+            raw_name = cols[name_idx].get_text(strip=True)
             skill_level = 0
             
-            # Use specific details column based on screenshot
-            if detail_idx != -1 and detail_idx < len(cols):
-                details_text = cols[detail_idx].get_text(separator=" ", strip=True).lower()
-                skill_match = re.search(r'\bs([0-9]|10)\b', details_text)
-                if skill_match: 
-                    skill_level = int(skill_match.group(1))
-
+            # Search entire row for "s2", "s3", etc.
+            row_text = row.get_text(separator=" ", strip=True).lower()
+            skill_match = re.search(r'\bs([0-9]|10)\b', row_text)
+            if skill_match:
+                skill_level = int(skill_match.group(1))
+            
             if raw_name and len(raw_name) > 1 and "student" not in raw_name.lower():
                 data.append({
                     "Student Name": clean_name(raw_name),
@@ -186,65 +179,79 @@ def parse_student_list(html_content):
     if not df.empty: df = df.drop_duplicates(subset=["Student Name"])
     return df
 
-def parse_skill_evals_v3(text_lines):
-    """
-    Since the Eval HTML format is breaking BS4, we parse the raw text lines directly.
-    This perfectly handles the format shown in the prompt context.
-    """
-    student_evals = {}
-    current_stage = None
-    students = []
+def parse_skill_evals_v4(html_content):
+    """Maps every student to {Stage: {total: X, incomplete: Y}}"""
+    soup = BeautifulSoup(html_content, 'lxml')
+    student_evals = {} 
+    tables = soup.find_all('table')
     
-    for i, line in enumerate(text_lines):
-        line = line.strip()
-        if not line: continue
-        
-        # 1. Detect Stage from the Title (e.g. "... - Flip Side Ninjas , Stage 1")
-        if "Stage" in line and "|" in line:
-            match = re.search(r'Stage\s*(\d+)', line, re.IGNORECASE)
+    for table in tables:
+        if table.find('table'): continue 
+        rows = [r for r in table.find_all('tr') if r.find_parent('table') == table]
+        if len(rows) < 2: continue
+            
+        # Find the Stage for this table by looking above it
+        table_stage = None
+        for tag in table.find_all_previous(['h1', 'h2', 'h3', 'h4', 'div', 'p', 'b', 'strong', 'span']):
+            text = tag.get_text(separator=" ", strip=True)
+            match = re.search(r'\b(?:stage|level|s)\s*0*(\d+)\b', text, re.IGNORECASE)
             if match:
-                current_stage = int(match.group(1))
-                students = [] # Reset students for the new table
-            continue
-            
-        # 2. Extract Student Names (e.g. "ElijahAbide (1)")
-        # We look for lines containing no spaces and ending in a number in parenthesis
-        if current_stage is not None and re.match(r'^[A-Za-z\-]+\s*\(\d+\)$', line):
-            raw_name = line.split('(')[0].strip()
-            students.append(clean_name(raw_name))
-            continue
-            
-        # 3. Detect Skill Row & Scores
-        # If we have a stage, and we have students, and the line looks like a skill description
-        if current_stage is not None and len(students) > 0:
-            # Skills usually start with letters and have a number at the very end
-            if re.match(r'^[A-Za-z\*]+', line):
-                # We found a skill. The next N valid lines should be scores/dates.
-                scores = []
-                j = i + 1
-                while j < len(text_lines) and len(scores) < len(students):
-                    next_line = text_lines[j].strip()
-                    # Skip date lines
-                    if re.match(r'^\d{4}-\d{2}-\d{2}', next_line):
-                        j += 1
-                        continue
-                    if next_line: # It's a score!
-                        scores.append(next_line)
-                    j += 1
+                table_stage = int(match.group(1))
+                break
+
+        # Find the row containing the Student Names
+        students = []
+        student_row_idx = -1
+        for i, row in enumerate(rows[:5]):
+            cols = [c for c in row.find_all(['td', 'th']) if c.find_parent('tr') == row]
+            if len(cols) > 2:
+                # If there are multiple columns, check if they contain names like "LucasArenhart (7)"
+                cell_text = cols[1].get_text(separator=" ", strip=True)
+                if re.search(r'[a-zA-Z]', cell_text):
+                    students = [clean_name(c.get_text(separator=" ", strip=True)) for c in cols[1:]]
+                    if any(len(s) > 2 for s in students):
+                        student_row_idx = i
+                        break
+        
+        if not students or student_row_idx == -1: continue 
+
+        current_stage = table_stage
+        for row in rows[student_row_idx + 1:]:
+            cols = [c for c in row.find_all(['td', 'th']) if c.find_parent('tr') == row]
+            if not cols: continue
                 
-                # Grade the scores
+            # Handle internal sub-headers (e.g., "Stage 3 - Wall")
+            if len(cols) == 1:
+                text = cols[0].get_text(separator=" ", strip=True)
+                match = re.search(r'\b(?:stage|level|s)[-\s]?0*(\d+)\b', text, re.IGNORECASE)
+                if match: current_stage = int(match.group(1))
+                continue
+                
+            # Grade standard skills
+            if len(cols) > 1:
+                skill_name = cols[0].get_text(separator=" ", strip=True)
+                row_stage = current_stage
+                
+                lvl_match = re.search(r'\b(?:stage|level|s)[-\s]?0*(\d+)\b', skill_name, re.IGNORECASE)
+                if lvl_match: row_stage = int(lvl_match.group(1))
+                    
+                if row_stage is None: continue 
+                    
+                scores = cols[1:] 
                 for idx, s_name in enumerate(students):
+                    if not s_name: continue
                     if idx < len(scores):
-                        inc_status = is_skill_incomplete(scores[idx])
-                        
+                        score_text = scores[idx].get_text(separator=" ", strip=True)
+                        is_inc = is_skill_incomplete(score_text)
+                                    
                         if s_name not in student_evals:
                             student_evals[s_name] = {}
-                        if current_stage not in student_evals[s_name]:
-                            student_evals[s_name][current_stage] = {'total': 0, 'incomplete': 0}
+                        if row_stage not in student_evals[s_name]:
+                            student_evals[s_name][row_stage] = {'total': 0, 'incomplete': 0}
                             
-                        student_evals[s_name][current_stage]['total'] += 1
-                        if inc_status:
-                            student_evals[s_name][current_stage]['incomplete'] += 1
+                        student_evals[s_name][row_stage]['total'] += 1
+                        if is_inc:
+                            student_evals[s_name][row_stage]['incomplete'] += 1
                             
     return student_evals
 
@@ -283,8 +290,8 @@ def export_to_google_sheets(df):
 
 # --- MAIN UI ---
 
-st.title("⭐ Ninja Rank Up Processor 3.2")
-st.write("Upload all three files to cross-reference a student's **Current Level** with their **Target Evaluation Scores**.")
+st.title("⭐ Ninja Rank Up Processor 4.0")
+st.write("Upload all three files to flag students who have completed their target stage.")
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -292,20 +299,12 @@ with col1:
 with col2:
     file_list = st.file_uploader("2. Student List", type=['html', 'htm'])
 with col3:
-    file_eval = st.file_uploader("3. Skill Evaluation", type=['html', 'htm', 'txt'])
+    file_eval = st.file_uploader("3. Skill Evaluation", type=['html', 'htm'])
 
 if file_roll and file_list and file_eval:
     content_roll = file_roll.read().decode("utf-8", errors='ignore')
     content_list = file_list.read().decode("utf-8", errors='ignore')
-    
-    # Handle both HTML and Text copy/pastes for Evals just in case
     content_eval = file_eval.read().decode("utf-8", errors='ignore')
-    eval_lines = []
-    if "<html>" in content_eval.lower() or "<table" in content_eval.lower():
-        soup = BeautifulSoup(content_eval, 'lxml')
-        eval_lines = soup.get_text(separator='\n').split('\n')
-    else:
-        eval_lines = content_eval.split('\n')
     
     st.divider()
     
@@ -313,55 +312,92 @@ if file_roll and file_list and file_eval:
         try:
             df_roll = parse_roll_sheet(content_roll)
             df_list = parse_student_list(content_list)
-            evals_dict = parse_skill_evals_v3(eval_lines)
+            evals_dict = parse_skill_evals_v4(content_eval)
             
-            # OUTER JOIN to ensure no student is dropped due to mismatched names
             merged_df = pd.merge(df_roll, df_list, on="Student Name", how="outer")
-            merged_df["Group"] = merged_df["Group"].fillna("No Group")
-            merged_df["Class Name"] = merged_df["Class Name"].fillna("Unknown Class")
+
+            # ---------------------------------------------------------
+            # 🛠️ DEBUG CONSOLE - See what the computer sees!
+            # ---------------------------------------------------------
+            with st.expander("🛠️ DEBUG CONSOLE - Check Lucas and Adaline Here", expanded=True):
+                st.write(f"**Total Students Evaluated:** {len(evals_dict)}")
+                
+                test_names = ["Lucas Arenhart", "Adaline Hearndon"]
+                for name in test_names:
+                    st.markdown(f"### Target: {name}")
+                    
+                    # 1. Did we find them in the Roll Sheet/Student List?
+                    student_info = merged_df[merged_df['Student Name'] == name]
+                    if not student_info.empty:
+                        last_passed = student_info['Current Level'].iloc[0]
+                        st.write(f"✅ Found in System Data. Last Passed Level: **Stage {last_passed}**")
+                    else:
+                        st.write(f"❌ NOT found in System Data. (Check if their name is spelled differently)")
+                        
+                    # 2. Did we find their Grades?
+                    if name in evals_dict:
+                        st.write(f"✅ Found in Evaluation Report! Grades:")
+                        st.json(evals_dict[name])
+                    else:
+                        st.write(f"❌ NOT found in Evaluation Report.")
+            # ---------------------------------------------------------
             
             results = []
-            for _, row in merged_df.iterrows():
-                s_name = row['Student Name']
-                last_passed = int(row.get('Current Level', 0)) if pd.notna(row.get('Current Level')) else 0
-                target_lvl = last_passed + 1 # We specifically evaluate for the NEXT stage
+            # We iterate through EVERY student who was evaluated, guaranteeing nobody is dropped
+            for s_name, stages in evals_dict.items():
                 
-                if s_name in evals_dict and target_lvl in evals_dict[s_name]:
-                    eval_data = evals_dict[s_name][target_lvl]
-                    total = eval_data['total']
-                    inc = eval_data['incomplete']
-                    
-                    if total > 0:
-                        if inc == 0:
-                            status = f"Stage {target_lvl} complete (not marked)"
-                        elif inc == 1:
-                            status = f"1 skill away (Stage {target_lvl})"
-                        elif inc <= 3:
-                            status = f"{inc} skills away (Stage {target_lvl})"
-                        else:
-                            continue 
+                # Retrieve their background info if we have it
+                student_info = merged_df[merged_df['Student Name'] == s_name]
+                last_passed = 0
+                group = "No Group"
+                class_name = "Unknown Class"
+                age = ""
+                
+                if not student_info.empty:
+                    row = student_info.iloc[0]
+                    last_passed = int(row.get('Current Level', 0)) if pd.notna(row.get('Current Level')) else 0
+                    group = row.get('Group', 'No Group')
+                    class_name = row.get('Class Name', 'Unknown Class')
+                    age = extract_digits(row.get('Age', ''))
+
+                # Target Logic: If we know their last passed, check the NEXT level.
+                # If we don't know it, check whatever stages they took.
+                levels_to_check = [last_passed + 1] if last_passed > 0 else list(stages.keys())
+
+                for target_lvl in levels_to_check:
+                    if target_lvl in stages:
+                        eval_data = stages[target_lvl]
+                        total = eval_data['total']
+                        inc = eval_data['incomplete']
+                        
+                        if total > 0:
+                            if inc == 0:
+                                status = f"Stage {target_lvl} complete (not marked)"
+                            elif inc == 1:
+                                status = f"1 skill away (Stage {target_lvl})"
+                            elif inc <= 3:
+                                status = f"{inc} skills away (Stage {target_lvl})"
+                            else:
+                                continue 
+                                
+                            age_str = f" ({age})" if age else ""
+                            display_name = f"{s_name}{age_str}"
+                            day, sort_time, _ = parse_class_info(class_name)
                             
-                        # Format Name with Age
-                        age_val = extract_digits(row.get('Age', ''))
-                        age_str = f" ({age_val})" if age_val else ""
-                        display_name = f"{s_name}{age_str}"
-                        
-                        day, sort_time, time_str = parse_class_info(row['Class Name'])
-                        
-                        results.append({
-                            "Student Name": display_name,
-                            "Group": row['Group'],
-                            "Class Name": row['Class Name'],
-                            "Status": status,
-                            "Sort Day": day,
-                            "Sort Time": sort_time,
-                            "Incomplete": inc 
-                        })
+                            results.append({
+                                "Student Name": display_name,
+                                "Group": group,
+                                "Class Name": class_name,
+                                "Status": status,
+                                "Sort Day": day,
+                                "Sort Time": sort_time,
+                                "Incomplete": inc 
+                            })
             
             final_df = pd.DataFrame(results)
             
             if final_df.empty:
-                st.warning("No students are currently within 3 skills of ranking up for their NEXT stage.")
+                st.warning("No students met the criteria to rank up.")
             else:
                 final_df = final_df.drop_duplicates()
                 st.success(f"Found {len(final_df)} students ready or nearly ready to rank up!")
