@@ -220,8 +220,9 @@ def parse_skill_evals_v5(html_content):
                     skill_name = cols[0].get_text(separator=" ", strip=True)
                     skill_lower = skill_name.lower()
                     
-                    # BLOCK THE 39/39 BUG!
-                    if any(word in skill_lower for word in ['total', 'average', 'overall', 'score', 'printout']):
+                    # BLOCK THE 39/39 BUG (Ignore metadata and empty spacer rows)
+                    skip_words = ['total', 'average', 'overall', 'score', 'printout', 'date', 'passed', 'note', 'comment']
+                    if not skill_lower or any(word in skill_lower for word in skip_words):
                         continue
                         
                     row_stage = current_stage
