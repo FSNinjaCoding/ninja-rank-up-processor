@@ -363,12 +363,13 @@ if file_roll and file_list and file_eval:
                         total = eval_data['total']
                         inc = eval_data['incomplete']
                         
-                        if total > 0:
+                       if total > 0:
                             if inc == 0:
                                 status = f"Stage {target_lvl} complete (not marked)"
+                                break  # <--- ADD THIS LINE! It stops the loop from overwriting this status.
                             elif inc == 1:
                                 status = f"1 skill away (Stage {target_lvl})"
-                            elif inc <= 2:
+                            elif inc <= 2:   
                                 status = f"{inc} skills away (Stage {target_lvl})"
                             else:
                                 continue 
