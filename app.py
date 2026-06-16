@@ -368,7 +368,7 @@ if file_roll and file_list and file_eval:
                                 status = f"Stage {target_lvl} complete (not marked)"
                             elif inc == 1:
                                 status = f"1 skill away (Stage {target_lvl})"
-                            elif inc <= 3:
+                            elif inc <= 2:
                                 status = f"{inc} skills away (Stage {target_lvl})"
                             else:
                                 continue 
