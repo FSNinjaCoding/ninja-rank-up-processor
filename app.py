@@ -8,8 +8,8 @@ import re
 # --- CONFIGURATION ---
 GOOGLE_SHEET_NAME = "Ninja_Rank_Up_Output"
 
-# VERSION UPDATE: 4.0
-st.set_page_config(page_title="Ninja Rank Up Processor 4.0", page_icon="⭐", layout="wide")
+# VERSION UPDATE: 4.1
+st.set_page_config(page_title="Ninja Rank Up Processor 4.1", page_icon="⭐", layout="wide")
 
 # --- HELPER FUNCTIONS ---
 
@@ -29,8 +29,8 @@ def clean_name(name):
         if len(parts) == 2:
             name = f"{parts[1].strip()} {parts[0].strip()}"
             
-    # 4. Strip out any weird hidden characters or extra spaces
-    name = re.sub(r'[^a-zA-Z\s\-]', '', name)
+    # 4. Strip out any weird hidden characters but keep apostrophes and hyphens
+    name = re.sub(r"[^a-zA-Z\s\-']", '', name)
     return re.sub(r'\s+', ' ', name).strip().title()
 
 def abbreviate_class_name(name):
@@ -121,9 +121,9 @@ def parse_roll_sheet(html_content):
             raw_name = cols[name_idx].get_text(strip=True)
             skill_level = 0
             
-            # Search entire row for "s2", "s3", etc.
+            # Robust search of the entire row for "s2", "Stage 2", "Level 2"
             row_text = row.get_text(separator=" ", strip=True).lower()
-            skill_match = re.search(r'\bs([0-9]|10)\b', row_text)
+            skill_match = re.search(r'\b(?:stage|level|s)[-\s]?0*(\d+)\b', row_text, re.IGNORECASE)
             if skill_match:
                 skill_level = int(skill_match.group(1))
             
@@ -190,37 +190,54 @@ def parse_skill_evals_v4(html_content):
         rows = [r for r in table.find_all('tr') if r.find_parent('table') == table]
         if len(rows) < 2: continue
             
-        # Find the Stage for this table by looking above it
+        # 1. FOOLPROOF STAGE EXTRACTION
         table_stage = None
-        for tag in table.find_all_previous(['h1', 'h2', 'h3', 'h4', 'div', 'p', 'b', 'strong', 'span']):
-            text = tag.get_text(separator=" ", strip=True)
-            match = re.search(r'\b(?:stage|level|s)\s*0*(\d+)\b', text, re.IGNORECASE)
+        
+        # Check inside the first few rows of the table
+        for row in rows[:3]:
+            text = row.get_text(separator=" ", strip=True)
+            match = re.search(r'\b(?:stage|level|s)[-\s]?0*(\d+)\b', text, re.IGNORECASE)
             if match:
                 table_stage = int(match.group(1))
                 break
+                
+        # Fallback to navigating pure text elements above the table (stops bleed-over)
+        if table_stage is None:
+            curr = table.previous_element
+            count = 0
+            while curr and count < 150:
+                if isinstance(curr, str) and curr.strip():
+                    match = re.search(r'\b(?:stage|level|s)[-\s]?0*(\d+)\b', curr.strip(), re.IGNORECASE)
+                    if match:
+                        table_stage = int(match.group(1))
+                        break
+                curr = curr.previous_element
+                count += 1
 
-        # Find the row containing the Student Names
+        # 2. FIND STUDENT NAMES
         students = []
         student_row_idx = -1
         for i, row in enumerate(rows[:5]):
             cols = [c for c in row.find_all(['td', 'th']) if c.find_parent('tr') == row]
             if len(cols) > 2:
-                # If there are multiple columns, check if they contain names like "LucasArenhart (7)"
-                cell_text = cols[1].get_text(separator=" ", strip=True)
-                if re.search(r'[a-zA-Z]', cell_text):
-                    students = [clean_name(c.get_text(separator=" ", strip=True)) for c in cols[1:]]
-                    if any(len(s) > 2 for s in students):
-                        student_row_idx = i
-                        break
+                # Bypass merged headers
+                if not cols[0].has_attr('colspan') or int(cols[0].get('colspan', 1)) == 1:
+                    cell_text = cols[1].get_text(separator=" ", strip=True)
+                    if re.search(r'[a-zA-Z]', cell_text):
+                        students = [clean_name(c.get_text(separator=" ", strip=True)) for c in cols[1:]]
+                        if any(len(s) > 2 for s in students):
+                            student_row_idx = i
+                            break
         
         if not students or student_row_idx == -1: continue 
 
+        # 3. SCORE THE SKILLS
         current_stage = table_stage
         for row in rows[student_row_idx + 1:]:
             cols = [c for c in row.find_all(['td', 'th']) if c.find_parent('tr') == row]
             if not cols: continue
                 
-            # Handle internal sub-headers (e.g., "Stage 3 - Wall")
+            # Internal sub-header row overrides the stage (e.g. "Stage 3 - Wall")
             if len(cols) == 1:
                 text = cols[0].get_text(separator=" ", strip=True)
                 match = re.search(r'\b(?:stage|level|s)[-\s]?0*(\d+)\b', text, re.IGNORECASE)
@@ -232,10 +249,15 @@ def parse_skill_evals_v4(html_content):
                 skill_name = cols[0].get_text(separator=" ", strip=True)
                 row_stage = current_stage
                 
+                # Check if the specific skill overrides the stage
                 lvl_match = re.search(r'\b(?:stage|level|s)[-\s]?0*(\d+)\b', skill_name, re.IGNORECASE)
                 if lvl_match: row_stage = int(lvl_match.group(1))
                     
-                if row_stage is None: continue 
+                if row_stage is None: 
+                    # Ultimate fallback: Look for a raw number in the skill name
+                    match = re.search(r'\b(\d)\b', skill_name)
+                    if match: row_stage = int(match.group(1))
+                    else: continue
                     
                 scores = cols[1:] 
                 for idx, s_name in enumerate(students):
@@ -290,7 +312,7 @@ def export_to_google_sheets(df):
 
 # --- MAIN UI ---
 
-st.title("⭐ Ninja Rank Up Processor 4.0")
+st.title("⭐ Ninja Rank Up Processor 4.1")
 st.write("Upload all three files to flag students who have completed their target stage.")
 
 col1, col2, col3 = st.columns(3)
@@ -316,37 +338,9 @@ if file_roll and file_list and file_eval:
             
             merged_df = pd.merge(df_roll, df_list, on="Student Name", how="outer")
 
-            # ---------------------------------------------------------
-            # 🛠️ DEBUG CONSOLE - See what the computer sees!
-            # ---------------------------------------------------------
-            with st.expander("🛠️ DEBUG CONSOLE - Check Lucas and Adaline Here", expanded=True):
-                st.write(f"**Total Students Evaluated:** {len(evals_dict)}")
-                
-                test_names = ["Lucas Arenhart", "Adaline Hearndon"]
-                for name in test_names:
-                    st.markdown(f"### Target: {name}")
-                    
-                    # 1. Did we find them in the Roll Sheet/Student List?
-                    student_info = merged_df[merged_df['Student Name'] == name]
-                    if not student_info.empty:
-                        last_passed = student_info['Current Level'].iloc[0]
-                        st.write(f"✅ Found in System Data. Last Passed Level: **Stage {last_passed}**")
-                    else:
-                        st.write(f"❌ NOT found in System Data. (Check if their name is spelled differently)")
-                        
-                    # 2. Did we find their Grades?
-                    if name in evals_dict:
-                        st.write(f"✅ Found in Evaluation Report! Grades:")
-                        st.json(evals_dict[name])
-                    else:
-                        st.write(f"❌ NOT found in Evaluation Report.")
-            # ---------------------------------------------------------
-            
             results = []
-            # We iterate through EVERY student who was evaluated, guaranteeing nobody is dropped
             for s_name, stages in evals_dict.items():
                 
-                # Retrieve their background info if we have it
                 student_info = merged_df[merged_df['Student Name'] == s_name]
                 last_passed = 0
                 group = "No Group"
@@ -360,8 +354,7 @@ if file_roll and file_list and file_eval:
                     class_name = row.get('Class Name', 'Unknown Class')
                     age = extract_digits(row.get('Age', ''))
 
-                # Target Logic: If we know their last passed, check the NEXT level.
-                # If we don't know it, check whatever stages they took.
+                # Safety Net: If Roll Sheet didn't list a level, test whatever they took.
                 levels_to_check = [last_passed + 1] if last_passed > 0 else list(stages.keys())
 
                 for target_lvl in levels_to_check:
