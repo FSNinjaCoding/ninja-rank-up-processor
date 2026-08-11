@@ -4,6 +4,7 @@ from bs4 import BeautifulSoup
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import re
+from datetime import date
 
 GOOGLE_SHEET_NAME = "Ninja_Rank_Up_Output"
 
@@ -16,13 +17,51 @@ DAY_ORDER = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 
 
 # Attendance since last level passed. A student who has passed Stage N and has
 # attended MORE than this many classes since is taking longer than expected.
-# Stage 0 (nothing passed yet) has no threshold and is never flagged.
-ATTENDANCE_THRESHOLDS = {1: 8, 2: 10, 3: 12, 4: 12, 5: 16, 6: 16, 7: 20, 8: 24, 9: 28, 10: 34}
+# Key 0 covers students who have not passed any stage yet.
+ATTENDANCE_THRESHOLDS = {0: 12, 1: 12, 2: 16, 3: 20, 4: 24, 5: 28, 6: 32, 7: 36, 8: 40, 9: 44, 10: 48}
+
+# Days since the student's last skill sign-off (a score of 3). Keyed by the last
+# stage they passed; students with no stage yet use the same pace as Stages 1-4.
+SIGNOFF_DAYS = {0: 21, 1: 21, 2: 21, 3: 21, 4: 21, 5: 30, 6: 30, 7: 45, 8: 45, 9: 60, 10: 60}
+
+# Students on the student list but not on any roll sheet have no class to act on,
+# so they are left out of the report. Flip to False to include them.
+REQUIRE_CLASS = True
 
 # Row ordering inside a single class time slot.
 PRIORITY_COMPLETE = 0
 PRIORITY_ONE_AWAY = 1
 PRIORITY_STRUGGLING = 2
+
+
+CELL_SCORE_DATE_RE = re.compile(r'(?P<score>\d)\s+(?P<date>\d{4}-\d{2}-\d{2})')
+REPORT_DATE_RE = re.compile(r'(\d{1,2})/(\d{1,2})/(\d{4})')
+
+
+def parse_report_date(html_content):
+    """The eval printout is titled 'Skill Evaluation Printout Sheets for 08/11/2026'.
+    Sign-off ages are measured from that date so re-running an older export still
+    gives the same answers. Falls back to today if the title is missing."""
+    m = re.search(r'<title[^>]*>(.*?)</title>', html_content[:20000], re.IGNORECASE | re.DOTALL)
+    if m:
+        d = REPORT_DATE_RE.search(m.group(1))
+        if d:
+            try:
+                return date(int(d.group(3)), int(d.group(1)), int(d.group(2)))
+            except ValueError:
+                pass
+    return date.today()
+
+
+def parse_cell_score_date(text):
+    """Cells read '3 2026-07-30 18:44:14'. Returns (score, date) or (None, None)."""
+    m = CELL_SCORE_DATE_RE.search(str(text))
+    if not m:
+        return None, None
+    try:
+        return int(m.group('score')), date.fromisoformat(m.group('date'))
+    except ValueError:
+        return None, None
 
 
 def clean_name(name):
@@ -183,14 +222,20 @@ def parse_student_list(html_content):
 
 
 def parse_skill_evals_v5(html_content):
-    """Returns {student: {stage: {'total': n, 'incomplete': n}}}.
+    """Returns ({student: {stage: {'total': n, 'incomplete': n}}},
+                {student: {'last_signoff': date|None, 'last_mark': date|None}}).
 
     Skills are collected per (student, stage) keyed by SKILL NAME, so a student who
     shows up on two eval printouts (two classes) is not counted twice. If the same
     skill is marked complete on one sheet and blank on another, the completion wins.
+
+    Every marked cell carries a timestamp, so the newest one doubles as the date the
+    student last had something signed off: 'last_signoff' tracks full 3s only,
+    'last_mark' tracks any score so a student with only 1s and 2s still has a clock.
     """
     soup = BeautifulSoup(html_content, 'lxml')
     skill_map = {}
+    signoff_map = {}
     current_global_stage = None
     for element in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'div', 'table']):
         if element.name != 'table':
@@ -246,16 +291,24 @@ def parse_skill_evals_v5(html_content):
             for idx, s_name in enumerate(students):
                 if not s_name or idx >= len(scores):
                     continue
-                complete = not is_skill_incomplete(scores[idx].get_text(separator=" ", strip=True))
+                cell_text = scores[idx].get_text(separator=" ", strip=True)
+                complete = not is_skill_incomplete(cell_text)
                 skills = skill_map.setdefault(s_name, {}).setdefault(row_stage, {})
                 skills[sl] = skills.get(sl, False) or complete
+                seen = signoff_map.setdefault(s_name, {'last_signoff': None, 'last_mark': None})
+                score, marked_on = parse_cell_score_date(cell_text)
+                if marked_on:
+                    if seen['last_mark'] is None or marked_on > seen['last_mark']:
+                        seen['last_mark'] = marked_on
+                    if score == 3 and (seen['last_signoff'] is None or marked_on > seen['last_signoff']):
+                        seen['last_signoff'] = marked_on
     student_evals = {}
     for s_name, stages in skill_map.items():
         for stage, skills in stages.items():
             student_evals.setdefault(s_name, {})[stage] = {
                 'total': len(skills),
                 'incomplete': sum(1 for done in skills.values() if not done)}
-    return student_evals
+    return student_evals, signoff_map
 
 
 def evaluate_rank_status(stages, last_passed):
@@ -280,17 +333,41 @@ def evaluate_rank_status(stages, last_passed):
 
 def evaluate_attendance_status(last_passed, attendance):
     """Flags a student who has attended more classes since passing their last stage
-    than the stage's expected pace. Returns (status_text, classes_over_threshold)."""
+    than the stage's expected pace. Returns (status_text, classes_over_threshold).
+    Note: iClassPro leaves the attendance column blank for students who have not
+    passed a stage yet, so the stage-0 threshold only fires if that count is filled in."""
     threshold = ATTENDANCE_THRESHOLDS.get(last_passed)
     if threshold is None or attendance is None:
         return None, 0
     if attendance > threshold:
         label = "class" if attendance == 1 else "classes"
-        return f"Struggling - {attendance} {label} since Stage {last_passed}", attendance - threshold
+        stage_label = f"Stage {last_passed}" if last_passed else "starting"
+        return f"Overdue - {attendance} {label} since {stage_label}", attendance - threshold
     return None, 0
 
 
-def build_results(df_roll, df_list, evals_dict):
+def evaluate_signoff_status(last_passed, signoff_info, report_date):
+    """Flags a student whose skills have gone stale - no full sign-off (a 3) within
+    the window for their stage. A student with only 1s and 2s is measured from that
+    most recent partial mark; a student with nothing marked anywhere is always
+    flagged. Returns (status_text, days_past_window)."""
+    window = SIGNOFF_DAYS.get(last_passed, max(SIGNOFF_DAYS.values()))
+    last_signoff = signoff_info.get('last_signoff') if signoff_info else None
+    last_mark = signoff_info.get('last_mark') if signoff_info else None
+    reference = last_signoff or last_mark
+    if reference is None:
+        return "No skills marked at all", 99999
+    days = (report_date - reference).days
+    if days <= window:
+        return None, 0
+    label = "day" if days == 1 else "days"
+    suffix = "" if last_signoff else " (partial marks only)"
+    return f"No sign-off in {days} {label}{suffix}", days - window
+
+
+def build_results(df_roll, df_list, evals_dict, signoff_dict=None, report_date=None):
+    signoff_dict = signoff_dict or {}
+    report_date = report_date or date.today()
     merged = pd.merge(df_roll, df_list, on="Student Name", how="outer")
     names = list(dict.fromkeys(list(merged["Student Name"]) + list(evals_dict.keys())))
     results = []
@@ -309,26 +386,29 @@ def build_results(df_roll, df_list, evals_dict):
 
         rank_status, rank_priority = evaluate_rank_status(evals_dict.get(s_name), last_passed)
         att_status, att_over = evaluate_attendance_status(last_passed, attendance)
-        if not rank_status and not att_status:
+        sign_status, days_over = evaluate_signoff_status(last_passed, signoff_dict.get(s_name), report_date)
+        if not rank_status and not att_status and not sign_status:
+            continue
+        if REQUIRE_CLASS and class_name == "Unknown Class":
             continue
 
-        # One row per student; if both flags fire, the notes are joined.
-        status = " | ".join(p for p in (rank_status, att_status) if p)
+        # One row per student; every flag that fires is joined into the one status.
+        status = " | ".join(p for p in (rank_status, att_status, sign_status) if p)
         priority = rank_priority if rank_priority is not None else PRIORITY_STRUGGLING
         age_str = f" ({age})" if age else ""
         day, day_num, sort_time, _ = parse_class_info(class_name)
         results.append({"Student Name": f"{s_name}{age_str}", "Group": group,
                         "Class Name": class_name, "Status": status,
                         "Sort Day": day, "Sort Day Num": day_num, "Sort Time": sort_time,
-                        "Priority": priority, "Over By": att_over})
+                        "Priority": priority, "Days Over": days_over, "Over By": att_over})
     df = pd.DataFrame(results)
     if df.empty:
         return df
-    # Order: weekday (Mon->Sun), then time of day, then rank-ups before struggling
-    # flags, then furthest past the attendance threshold first.
+    # Order: weekday (Mon->Sun), then time of day, then rank-ups ahead of the
+    # behind-pace flags, then the most stalled students first inside that group.
     df = df.drop_duplicates()
-    return df.sort_values(by=['Sort Day Num', 'Sort Time', 'Priority', 'Over By', 'Student Name'],
-                          ascending=[True, True, True, False, True])
+    return df.sort_values(by=['Sort Day Num', 'Sort Time', 'Priority', 'Days Over', 'Over By', 'Student Name'],
+                          ascending=[True, True, True, False, False, True])
 
 
 def export_to_google_sheets(df):
@@ -356,8 +436,8 @@ def export_to_google_sheets(df):
     return f"https://docs.google.com/spreadsheets/d/{ss.id}"
 
 
-st.set_page_config(page_title="Ninja Rank Up Processor 4.5", page_icon="star", layout="wide")
-st.title("Ninja Rank Up Processor 4.5")
+st.set_page_config(page_title="Ninja Rank Up Processor 4.7", page_icon="star", layout="wide")
+st.title("Ninja Rank Up Processor 4.7")
 st.write("Upload all three files to flag students who are ready to rank up or who are falling behind pace.")
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -376,16 +456,20 @@ if file_roll and file_list and file_eval:
         try:
             df_roll = parse_roll_sheet(content_roll)
             df_list = parse_student_list(content_list)
-            evals_dict = parse_skill_evals_v5(content_eval)
-            final_df = build_results(df_roll, df_list, evals_dict)
+            evals_dict, signoff_dict = parse_skill_evals_v5(content_eval)
+            report_date = parse_report_date(content_eval)
+            final_df = build_results(df_roll, df_list, evals_dict, signoff_dict, report_date)
             if final_df.empty:
                 st.warning("No students met the criteria to rank up.")
             else:
                 ready = int((final_df['Priority'] == PRIORITY_COMPLETE).sum())
                 close = int((final_df['Priority'] == PRIORITY_ONE_AWAY).sum())
-                behind = int(final_df['Status'].str.contains("Struggling").sum())
+                behind = int(final_df["Status"].str.contains("Overdue").sum())
+                stale = int(final_df["Status"].str.contains("No sign-off|No skills marked").sum())
+                st.caption(f"Sign-off ages measured from the eval report date: {report_date:%m/%d/%Y}")
                 st.success(f"{len(final_df)} students flagged - {ready} stage complete, "
-                           f"{close} one skill away, {behind} behind pace.")
+                           f"{close} one skill away, {behind} overdue on attendance, "
+                           f"{stale} with stale sign-offs.")
                 st.dataframe(final_df[["Student Name", "Group", "Class Name", "Status"]], use_container_width=True)
                 if st.button("Update Master Google Sheet", use_container_width=True):
                     link = export_to_google_sheets(final_df)
