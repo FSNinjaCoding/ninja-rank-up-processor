@@ -6,7 +6,6 @@ from oauth2client.service_account import ServiceAccountCredentials
 import re
 
 GOOGLE_SHEET_NAME = "Ninja_Rank_Up_Output"
-st.set_page_config(page_title="Ninja Rank Up Processor 4.4", page_icon="star", layout="wide")
 
 # Stage is read ONLY from section/table headers ("Stage N"/"Level N"), never from
 # a skill name. Skill names contain tokens like "S3"/"S2"; matching a bare "s" against
@@ -14,6 +13,16 @@ st.set_page_config(page_title="Ninja Rank Up Processor 4.4", page_icon="star", l
 EVAL_STAGE_RE = re.compile(r'\b(?:stage|level)\s*0*(\d+)\b', re.IGNORECASE)
 ROLL_STAGE_RE = re.compile(r'\b(?:stage|level|s)[-\s]?0*(\d+)\b', re.IGNORECASE)
 DAY_ORDER = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
+
+# Attendance since last level passed. A student who has passed Stage N and has
+# attended MORE than this many classes since is taking longer than expected.
+# Stage 0 (nothing passed yet) has no threshold and is never flagged.
+ATTENDANCE_THRESHOLDS = {1: 8, 2: 10, 3: 12, 4: 12, 5: 16, 6: 16, 7: 20, 8: 24, 9: 28, 10: 34}
+
+# Row ordering inside a single class time slot.
+PRIORITY_COMPLETE = 0
+PRIORITY_ONE_AWAY = 1
+PRIORITY_STRUGGLING = 2
 
 
 def clean_name(name):
@@ -41,8 +50,9 @@ def abbreviate_class_name(name):
 
 def parse_class_info(class_name):
     """Returns (day, day_num, sort_time, time_str). day_num orders Mon->Sun;
-    sort_time normalizes afternoon hours so a day sorts 1:10, 2:20, 3:40, 4:50, 6:00."""
-    if not isinstance(class_name, str) or class_name == "Not Found":
+    sort_time normalizes afternoon hours so a day sorts 1:10, 2:20, 3:40, 4:50, 6:00.
+    Anything unparsable sorts to the bottom (day_num 99 / sort_time 9999)."""
+    if not isinstance(class_name, str) or class_name in ("Not Found", "Unknown Class"):
         return "Lost", 99, 9999, ""
     dm = re.search(r'\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b', class_name, re.IGNORECASE)
     day = dm.group(1).title() if dm else "Lost"
@@ -60,6 +70,11 @@ def parse_class_info(class_name):
 def extract_digits(val):
     m = re.search(r'\d+', str(val))
     return m.group() if m else ""
+
+
+def to_int_or_none(val):
+    m = re.search(r'\d+', str(val)) if val is not None else None
+    return int(m.group()) if m else None
 
 
 def is_skill_incomplete(score_text):
@@ -136,7 +151,7 @@ def parse_student_list(html_content):
         if not rows:
             continue
         headers = [c.get_text(strip=True).lower() for c in rows[0].find_all(['td', 'th']) if c.find_parent('tr') == rows[0]]
-        name_idx, key_idx, age_idx = 1, 4, 3
+        name_idx, key_idx, age_idx, att_idx = 1, 4, 3, 2
         for i, h in enumerate(headers):
             if "student name" in h:
                 name_idx = i
@@ -144,6 +159,8 @@ def parse_student_list(html_content):
                 key_idx = i
             elif "age" in h:
                 age_idx = i
+            elif "attendance" in h:
+                att_idx = i
         for row in rows[1:]:
             cols = [c for c in row.find_all(['td', 'th']) if c.find_parent('tr') == row]
 
@@ -153,10 +170,12 @@ def parse_student_list(html_content):
             raw_name = get_val(name_idx)
             keywords_raw = get_val(key_idx).lower()
             age_raw = get_val(age_idx)
+            att_raw = get_val(att_idx)
             gm = re.search(r'(group\s*[1-3])', keywords_raw)
             ck = gm.group(0).capitalize() if gm else "No Group"
             if raw_name and len(raw_name) > 1:
-                data.append({"Student Name": clean_name(raw_name), "Group": ck, "Age": age_raw})
+                data.append({"Student Name": clean_name(raw_name), "Group": ck,
+                             "Age": age_raw, "Attendance": att_raw})
     df = pd.DataFrame(data)
     if not df.empty:
         df = df.drop_duplicates(subset=["Student Name"])
@@ -164,8 +183,14 @@ def parse_student_list(html_content):
 
 
 def parse_skill_evals_v5(html_content):
+    """Returns {student: {stage: {'total': n, 'incomplete': n}}}.
+
+    Skills are collected per (student, stage) keyed by SKILL NAME, so a student who
+    shows up on two eval printouts (two classes) is not counted twice. If the same
+    skill is marked complete on one sheet and blank on another, the completion wins.
+    """
     soup = BeautifulSoup(html_content, 'lxml')
-    student_evals = {}
+    skill_map = {}
     current_global_stage = None
     for element in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'div', 'table']):
         if element.name != 'table':
@@ -221,12 +246,89 @@ def parse_skill_evals_v5(html_content):
             for idx, s_name in enumerate(students):
                 if not s_name or idx >= len(scores):
                     continue
-                inc = is_skill_incomplete(scores[idx].get_text(separator=" ", strip=True))
-                student_evals.setdefault(s_name, {}).setdefault(row_stage, {'total': 0, 'incomplete': 0})
-                student_evals[s_name][row_stage]['total'] += 1
-                if inc:
-                    student_evals[s_name][row_stage]['incomplete'] += 1
+                complete = not is_skill_incomplete(scores[idx].get_text(separator=" ", strip=True))
+                skills = skill_map.setdefault(s_name, {}).setdefault(row_stage, {})
+                skills[sl] = skills.get(sl, False) or complete
+    student_evals = {}
+    for s_name, stages in skill_map.items():
+        for stage, skills in stages.items():
+            student_evals.setdefault(s_name, {})[stage] = {
+                'total': len(skills),
+                'incomplete': sum(1 for done in skills.values() if not done)}
     return student_evals
+
+
+def evaluate_rank_status(stages, last_passed):
+    """First stage above the student's current level that is finished but unmarked,
+    otherwise the first one that is exactly one skill short. Two or more skills
+    short is no longer reported."""
+    if not stages:
+        return None, None
+    best_status, best_priority = None, None
+    for target_lvl in sorted(stages.keys()):
+        if last_passed > 0 and target_lvl <= last_passed:
+            continue
+        ed = stages[target_lvl]
+        if ed['total'] <= 0:
+            continue
+        if ed['incomplete'] == 0:
+            return f"Stage {target_lvl} complete (not marked)", PRIORITY_COMPLETE
+        if ed['incomplete'] == 1 and best_status is None:
+            best_status, best_priority = f"1 skill away (Stage {target_lvl})", PRIORITY_ONE_AWAY
+    return best_status, best_priority
+
+
+def evaluate_attendance_status(last_passed, attendance):
+    """Flags a student who has attended more classes since passing their last stage
+    than the stage's expected pace. Returns (status_text, classes_over_threshold)."""
+    threshold = ATTENDANCE_THRESHOLDS.get(last_passed)
+    if threshold is None or attendance is None:
+        return None, 0
+    if attendance > threshold:
+        label = "class" if attendance == 1 else "classes"
+        return f"Struggling - {attendance} {label} since Stage {last_passed}", attendance - threshold
+    return None, 0
+
+
+def build_results(df_roll, df_list, evals_dict):
+    merged = pd.merge(df_roll, df_list, on="Student Name", how="outer")
+    names = list(dict.fromkeys(list(merged["Student Name"]) + list(evals_dict.keys())))
+    results = []
+    for s_name in names:
+        if not isinstance(s_name, str) or not s_name:
+            continue
+        student_info = merged[merged['Student Name'] == s_name]
+        last_passed, group, class_name, age, attendance = 0, "No Group", "Unknown Class", "", None
+        if not student_info.empty:
+            row = student_info.iloc[0]
+            last_passed = int(row.get('Current Level', 0)) if pd.notna(row.get('Current Level')) else 0
+            group = row.get('Group', 'No Group') if pd.notna(row.get('Group')) else "No Group"
+            class_name = row.get('Class Name', 'Unknown Class') if pd.notna(row.get('Class Name')) else "Unknown Class"
+            age = extract_digits(row.get('Age', ''))
+            attendance = to_int_or_none(row.get('Attendance', ''))
+
+        rank_status, rank_priority = evaluate_rank_status(evals_dict.get(s_name), last_passed)
+        att_status, att_over = evaluate_attendance_status(last_passed, attendance)
+        if not rank_status and not att_status:
+            continue
+
+        # One row per student; if both flags fire, the notes are joined.
+        status = " | ".join(p for p in (rank_status, att_status) if p)
+        priority = rank_priority if rank_priority is not None else PRIORITY_STRUGGLING
+        age_str = f" ({age})" if age else ""
+        day, day_num, sort_time, _ = parse_class_info(class_name)
+        results.append({"Student Name": f"{s_name}{age_str}", "Group": group,
+                        "Class Name": class_name, "Status": status,
+                        "Sort Day": day, "Sort Day Num": day_num, "Sort Time": sort_time,
+                        "Priority": priority, "Over By": att_over})
+    df = pd.DataFrame(results)
+    if df.empty:
+        return df
+    # Order: weekday (Mon->Sun), then time of day, then rank-ups before struggling
+    # flags, then furthest past the attendance threshold first.
+    df = df.drop_duplicates()
+    return df.sort_values(by=['Sort Day Num', 'Sort Time', 'Priority', 'Over By', 'Student Name'],
+                          ascending=[True, True, True, False, True])
 
 
 def export_to_google_sheets(df):
@@ -242,7 +344,6 @@ def export_to_google_sheets(df):
     except Exception as e:
         st.error(f"Could not open sheet. Error: {e}")
         return None
-    df = df.sort_values(by=['Sort Day Num', 'Sort Time', 'Incomplete'])
     export_df = df[["Student Name", "Group", "Class Name", "Status"]]
     try:
         ws = ss.worksheet("Rank Up Flags")
@@ -255,8 +356,9 @@ def export_to_google_sheets(df):
     return f"https://docs.google.com/spreadsheets/d/{ss.id}"
 
 
-st.title("Ninja Rank Up Processor 4.4")
-st.write("Upload all three files to flag students who have completed their target stage.")
+st.set_page_config(page_title="Ninja Rank Up Processor 4.5", page_icon="star", layout="wide")
+st.title("Ninja Rank Up Processor 4.5")
+st.write("Upload all three files to flag students who are ready to rank up or who are falling behind pace.")
 c1, c2, c3 = st.columns(3)
 with c1:
     file_roll = st.file_uploader("1. Roll Sheet", type=['html', 'htm'])
@@ -275,47 +377,15 @@ if file_roll and file_list and file_eval:
             df_roll = parse_roll_sheet(content_roll)
             df_list = parse_student_list(content_list)
             evals_dict = parse_skill_evals_v5(content_eval)
-            merged_df = pd.merge(df_roll, df_list, on="Student Name", how="outer")
-            results = []
-            for s_name, stages in evals_dict.items():
-                student_info = merged_df[merged_df['Student Name'] == s_name]
-                last_passed, group, class_name, age = 0, "No Group", "Unknown Class", ""
-                if not student_info.empty:
-                    row = student_info.iloc[0]
-                    last_passed = int(row.get('Current Level', 0)) if pd.notna(row.get('Current Level')) else 0
-                    group = row.get('Group', 'No Group')
-                    class_name = row.get('Class Name', 'Unknown Class')
-                    age = extract_digits(row.get('Age', ''))
-                best_status, best_inc = None, 999
-                for target_lvl in sorted(stages.keys()):
-                    if last_passed > 0 and target_lvl <= last_passed:
-                        continue
-                    ed = stages[target_lvl]
-                    total, inc = ed['total'], ed['incomplete']
-                    if total > 0:
-                        if inc == 0:
-                            best_status = f"Stage {target_lvl} complete (not marked)"
-                            best_inc = 0
-                            break
-                        elif inc <= 2 and best_status is None:
-                            best_status = (f"1 skill away (Stage {target_lvl})" if inc == 1
-                                           else f"{inc} skills away (Stage {target_lvl})")
-                            best_inc = inc
-                if best_status:
-                    age_str = f" ({age})" if age else ""
-                    day, day_num, sort_time, _ = parse_class_info(class_name)
-                    results.append({"Student Name": f"{s_name}{age_str}", "Group": group,
-                                    "Class Name": class_name, "Status": best_status,
-                                    "Sort Day": day, "Sort Day Num": day_num,
-                                    "Sort Time": sort_time, "Incomplete": best_inc})
-            final_df = pd.DataFrame(results)
+            final_df = build_results(df_roll, df_list, evals_dict)
             if final_df.empty:
                 st.warning("No students met the criteria to rank up.")
             else:
-                final_df = final_df.drop_duplicates()
-                # Order: weekday (Mon->Sun), then time of day, then closeness to ranking up.
-                final_df = final_df.sort_values(by=['Sort Day Num', 'Sort Time', 'Incomplete'])
-                st.success(f"Found {len(final_df)} students ready or nearly ready to rank up!")
+                ready = int((final_df['Priority'] == PRIORITY_COMPLETE).sum())
+                close = int((final_df['Priority'] == PRIORITY_ONE_AWAY).sum())
+                behind = int(final_df['Status'].str.contains("Struggling").sum())
+                st.success(f"{len(final_df)} students flagged - {ready} stage complete, "
+                           f"{close} one skill away, {behind} behind pace.")
                 st.dataframe(final_df[["Student Name", "Group", "Class Name", "Status"]], use_container_width=True)
                 if st.button("Update Master Google Sheet", use_container_width=True):
                     link = export_to_google_sheets(final_df)
