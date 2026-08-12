@@ -32,6 +32,12 @@ GROUP_ORDER_DEFAULT = 4
 # so they are left out of the report. Flip to False to include them.
 REQUIRE_CLASS = True
 
+# Roll sheet exports can be pulled with every program included. Only skill-based
+# classes belong in this report - open gym, makeup tokens and team training are not
+# where stages get signed off, and a student on those rosters would otherwise get
+# filed under the wrong class.
+NON_SKILL_CLASS_PATTERNS = ("open gym", "makeup token", "legacy", "ninja team")
+
 # One printable tab per weekday, plus the three sign-off columns the manager checks
 # off by hand on the printout.
 DAY_TAB_NAMES = {"Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday",
@@ -148,35 +154,55 @@ def is_skill_incomplete(score_text):
 def parse_attendance_csv(file_obj):
     """iClassPro's Student Attendance Report: Student, Date, Timeslot, Event Name,
     Status, Excused - one row per student per class occurrence. Returns
-    ({student: [dates present]}, window_start, window_end). 'Present (left early)'
-    counts as present; absences are ignored."""
+    ({student: [dates present]}, {student: {class: (times present, last date)}},
+    window_start, window_end). 'Present (left early)' counts as present; absences are
+    ignored. The per-class counts are what decide a student's home class when they
+    show up on more than one roster."""
     df = pd.read_csv(file_obj, encoding='utf-8-sig')
     cols = {c.strip().lower(): c for c in df.columns}
     name_col = cols.get('student')
     date_col = cols.get('date')
     status_col = cols.get('status')
+    event_col = cols.get('event name')
     if not (name_col and date_col and status_col):
-        return {}, None, None
+        return {}, {}, None, None
     df = df[df[status_col].astype(str).str.strip().str.lower().str.startswith('present')].copy()
     df['_date'] = pd.to_datetime(df[date_col], format='%m/%d/%Y', errors='coerce').dt.date
     df = df[df['_date'].notna()]
     if df.empty:
-        return {}, None, None
+        return {}, {}, None, None
     df['_name'] = df[name_col].map(clean_name)
     attended = {n: sorted(g['_date']) for n, g in df.groupby('_name')}
-    return attended, df['_date'].min(), df['_date'].max()
+    by_class = {}
+    if event_col:
+        df['_class'] = df[event_col].map(abbreviate_class_name)
+        for (n, c), g in df.groupby(['_name', '_class']):
+            by_class.setdefault(n, {})[c] = (len(g), max(g['_date']))
+    return attended, by_class, df['_date'].min(), df['_date'].max()
+
+
+def is_skill_class(class_name):
+    lowered = str(class_name).lower()
+    return not any(p in lowered for p in NON_SKILL_CLASS_PATTERNS)
 
 
 def parse_roll_sheet(html_content):
+    """Returns (rows, saw_details_column). One row per student PER CLASS - a student
+    on two rosters appears twice and is resolved later. The flag matters because the
+    Details column is the only place the roll sheet carries the last stage passed; an
+    export without it silently makes every student look like Stage 0."""
     soup = BeautifulSoup(html_content, 'lxml')
     data = []
+    saw_details = False
     headers = soup.find_all('div', class_='full-width-header')
     if not headers:
-        return pd.DataFrame()
+        return pd.DataFrame(), saw_details
     for header in headers:
         ns = header.find('span')
         cnr = ns.get_text(strip=True) if ns else header.get_text(separator=" ", strip=True)
         ccn = abbreviate_class_name(cnr)
+        if not is_skill_class(cnr):
+            continue
         table = header.find_next('table', class_='table-roll-sheet')
         if not table:
             continue
@@ -190,6 +216,7 @@ def parse_roll_sheet(html_content):
                 name_idx = idx
             if "detail" in ct:
                 details_idx = idx
+                saw_details = True
         if name_idx == -1:
             name_idx = 1
         for row in rows[1:]:
@@ -208,10 +235,32 @@ def parse_roll_sheet(html_content):
             if raw_name and len(raw_name) > 1 and "student" not in raw_name.lower():
                 data.append({"Student Name": clean_name(raw_name),
                              "Current Level": skill_level, "Class Name": ccn})
-    df = pd.DataFrame(data)
-    if not df.empty:
-        df = df.sort_values('Current Level', ascending=False).drop_duplicates(subset=["Student Name"], keep='first')
-    return df
+    return pd.DataFrame(data), saw_details
+
+
+def resolve_student_classes(df_roll, class_attendance=None):
+    """One row per student. A student on more than one roster - a makeup, a second
+    class, a leftover enrollment - is filed under the class they actually attend most
+    in the attendance window, falling back to the most recent attendance and then to
+    document order. The stage kept is the highest seen on any roster."""
+    if df_roll.empty:
+        return df_roll
+    class_attendance = class_attendance or {}
+    rows = []
+    for name, group in df_roll.groupby("Student Name", sort=False):
+        level = int(group["Current Level"].max())
+        if len(group) == 1:
+            chosen = group.iloc[0]["Class Name"]
+        else:
+            seen = class_attendance.get(name, {})
+
+            def rank(class_name):
+                count, last = seen.get(class_name, (0, None))
+                return (count, last or date.min)
+
+            chosen = max(list(group["Class Name"]), key=rank)
+        rows.append({"Student Name": name, "Current Level": level, "Class Name": chosen})
+    return pd.DataFrame(rows)
 
 
 def parse_student_list(html_content):
@@ -608,8 +657,8 @@ def export_to_google_sheets(df):
     return link, tabs, None
 
 
-st.set_page_config(page_title="Ninja Rank Up Processor 5.4", page_icon="star", layout="wide")
-st.title("Ninja Rank Up Processor 5.4")
+st.set_page_config(page_title="Ninja Rank Up Processor 5.5", page_icon="star", layout="wide")
+st.title("Ninja Rank Up Processor 5.5")
 st.write("Upload the three iClassPro reports to flag students who are ready to rank up or falling behind. "
          "The attendance CSV is optional but sharpens the sign-off flag.")
 c1, c2, c3, c4 = st.columns(4)
@@ -637,18 +686,25 @@ if file_roll and file_list and file_eval:
     st.divider()
     with st.spinner('Parsing and Cross-Referencing Stages...'):
         try:
-            df_roll = parse_roll_sheet(content_roll)
+            df_roll_raw, saw_details = parse_roll_sheet(content_roll)
+            if not df_roll_raw.empty and not saw_details:
+                st.error("This roll sheet has no **Details** column, which is where the last "
+                         "stage passed is stored. Every student would come through as no stage, "
+                         "so completed stages get reported as 'not marked'. Re-export the roll "
+                         "sheet with Details included (the saved Group Processor report).")
+                st.stop()
             df_list = parse_student_list(content_list)
             evals_dict, signoff_dict = parse_skill_evals_v5(content_eval)
             report_date = parse_report_date(content_eval)
-            attendance, window_start, window_end = None, None, None
+            attendance, class_attendance, window_start, window_end = None, {}, None, None
             if file_att is not None:
                 file_att.seek(0)
-                attendance, window_start, window_end = parse_attendance_csv(file_att)
+                attendance, class_attendance, window_start, window_end = parse_attendance_csv(file_att)
                 if not attendance:
                     st.warning("Could not read the attendance CSV - skill updates will be "
                                "checked over the last 30 days without attendance context.")
-                    attendance, window_start = None, None
+                    attendance, class_attendance, window_start = None, {}, None
+            df_roll = resolve_student_classes(df_roll_raw, class_attendance)
             final_df = build_results(df_roll, df_list, evals_dict, signoff_dict,
                                      report_date, attendance, window_start)
             if final_df.empty:
