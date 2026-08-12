@@ -15,10 +15,12 @@ EVAL_STAGE_RE = re.compile(r'\b(?:stage|level)\s*0*(\d+)\b', re.IGNORECASE)
 ROLL_STAGE_RE = re.compile(r'\b(?:stage|level|s)[-\s]?0*(\d+)\b', re.IGNORECASE)
 DAY_ORDER = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
 
-# Attendance since last level passed. A student who has passed Stage N and has
-# attended MORE than this many classes since is taking longer than expected.
-# Key 0 covers students who have not passed any stage yet.
-ATTENDANCE_THRESHOLDS = {0: 12, 1: 12, 2: 16, 3: 20, 4: 24, 5: 28, 6: 32, 7: 36, 8: 40, 9: 44, 10: 48}
+# Classes a student is expected to need to reach their NEXT stage, keyed by the last
+# stage they passed. Attending more than this without passing means they are overdue,
+# and the goal is named for the stage they are working toward - a student who last
+# passed Stage 1 is working on Stage 2 with a goal of 16. Stage 10 is the top of the
+# system, so a student who has passed it has no goal and never flags.
+ATTENDANCE_GOALS = {0: 12, 1: 16, 2: 20, 3: 24, 4: 28, 5: 32, 6: 36, 7: 40, 8: 44, 9: 48}
 
 # A student needs at least this many classes inside the window before a missing skill
 # update counts as a problem - one class is not enough to expect a coach to have
@@ -51,7 +53,7 @@ NON_SKILL_CLASS_PATTERNS = ("open gym", "makeup token", "legacy", "ninja team")
 DAY_TAB_NAMES = {"Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday",
                  "Thu": "Thursday", "Fri": "Friday", "Sat": "Saturday", "Sun": "Sunday"}
 CHECK_COLUMNS = ["Resolved", "Absent", "Aware"]
-PRIOR_ABSENCE_LABEL = "Prev. Absent"
+PRIOR_ABSENCE_LABEL = "Absent last wk"
 
 # Pasted straight from iClassPro, one student per line. Reported last on the row.
 NO_PHOTO_LABEL = "No Photo"
@@ -442,18 +444,17 @@ def evaluate_rank_status(stages, last_passed):
 
 
 def evaluate_attendance_status(last_passed, attendance):
-    """Flags a student who has attended more classes since passing their last stage
-    than the stage's expected pace. Returns (status_text, classes_over_threshold).
-    Note: iClassPro leaves the attendance column blank for students who have not
-    passed a stage yet, so the stage-0 threshold only fires if that count is filled in."""
-    threshold = ATTENDANCE_THRESHOLDS.get(last_passed)
-    if threshold is None or attendance is None:
+    """Flags a student who has attended more classes than the goal for the stage they
+    are working toward. Returns (status_text, classes_over_goal).
+    Note: iClassPro leaves the attendance column blank for students who have not passed
+    a stage yet, so the Stage 1 goal only fires once that count is filled in."""
+    goal = ATTENDANCE_GOALS.get(last_passed)
+    if goal is None or attendance is None:
         return None, 0
-    if attendance > threshold:
-        over = attendance - threshold
+    if attendance > goal:
+        over = attendance - goal
         label = "class" if over == 1 else "classes"
-        stage_label = f"Stage {last_passed}" if last_passed else "No Stage"
-        return f"+{over} {label} over ({stage_label} Goal = {threshold})", over
+        return f"+{over} {label} over (Stage {last_passed + 1} Goal = {goal})", over
     return None, 0
 
 
@@ -547,7 +548,7 @@ def build_results(df_roll, df_list, evals_dict, signoff_dict=None, report_date=N
 def build_day_blocks(df, day_code):
     """Lays out one weekday tab: a header row per class time (day + start time, with
     the three check-off columns), the students in that slot, then a blank spacer.
-    Column C reads "Prev. Absent" when the student missed their class in the week
+    Column C reads "Absent last wk" when the student missed their class in the week
     prior - context for why nothing got signed off - and is blank otherwise.
     Two classes running at the same time share one block, which is how the manager
     reads the floor. Returns (values, header_row_indexes, student_row_spans)."""
@@ -758,8 +759,8 @@ def show_howto(key):
             st.markdown(body)
 
 
-st.set_page_config(page_title="Ninja Rank Up Processor 6.0", page_icon="star", layout="wide")
-st.title("Ninja Rank Up Processor 6.0")
+st.set_page_config(page_title="Ninja Rank Up Processor 6.2", page_icon="star", layout="wide")
+st.title("Ninja Rank Up Processor 6.2")
 st.write("Upload the iClassPro reports to flag students who are ready to rank up or falling behind.")
 c1, c2, c3, c4 = st.columns(4)
 with c1:
