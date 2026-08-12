@@ -32,6 +32,13 @@ GROUP_ORDER_DEFAULT = 4
 # so they are left out of the report. Flip to False to include them.
 REQUIRE_CLASS = True
 
+# One printable tab per weekday, plus the three sign-off columns the manager checks
+# off by hand on the printout.
+DAY_TAB_NAMES = {"Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday",
+                 "Thu": "Thursday", "Fri": "Friday", "Sat": "Saturday", "Sun": "Sunday"}
+CHECK_COLUMNS = ["Resolved", "Absent", "Aware"]
+HEADER_GREY = {"red": 0.85, "green": 0.85, "blue": 0.85}
+
 # Row ordering inside a single class time slot.
 PRIORITY_COMPLETE = 0
 PRIORITY_ONE_AWAY = 1
@@ -433,10 +440,11 @@ def build_results(df_roll, df_list, evals_dict, signoff_dict=None, report_date=N
         priority = rank_priority if rank_priority is not None else (
             sign_priority if sign_priority is not None else PRIORITY_STRUGGLING)
         age_str = f" ({age})" if age else ""
-        day, day_num, sort_time, _ = parse_class_info(class_name)
+        day, day_num, sort_time, time_str = parse_class_info(class_name)
         results.append({"Student Name": f"{s_name}{age_str}", "Group": group,
                         "Class Name": class_name, "Status": status,
                         "Sort Day": day, "Sort Day Num": day_num, "Sort Time": sort_time,
+                        "Class Time": time_str,
                         "Group Rank": GROUP_ORDER.get(group, GROUP_ORDER_DEFAULT),
                         "Priority": priority, "Days Over": days_over, "Over By": att_over})
     df = pd.DataFrame(results)
@@ -450,10 +458,117 @@ def build_results(df_roll, df_list, evals_dict, signoff_dict=None, report_date=N
                           ascending=[True, True, True, True, False, False, True])
 
 
+def build_day_blocks(df, day_code):
+    """Lays out one weekday tab: a header row per class time (day + start time, with
+    the three check-off columns), the students in that slot, then a blank spacer.
+    Two classes running at the same time share one block, which is how the manager
+    reads the floor. Returns (values, header_row_indexes, student_row_spans)."""
+    day_df = df[df['Sort Day'] == day_code]
+    values, header_rows, student_spans = [], [], []
+    if day_df.empty:
+        return values, header_rows, student_spans
+    for _, block in day_df.groupby('Sort Time', sort=True):
+        time_str = str(block.iloc[0].get('Class Time') or "").strip()
+        label = f"{DAY_TAB_NAMES.get(day_code, day_code)} {time_str}".strip()
+        header_rows.append(len(values))
+        values.append([label, "", ""] + CHECK_COLUMNS)
+        first_student = len(values)
+        for _, row in block.iterrows():
+            values.append([row['Student Name'], row['Group'], row['Status'], "", "", ""])
+        student_spans.append((first_student, len(values) - 1))
+        values.append(["", "", "", "", "", ""])
+    return values, header_rows, student_spans
+
+
+def _day_tab_requests(sheet_id, values, header_rows, student_spans):
+    """Formatting for one weekday tab, as Sheets API requests: reset old formatting,
+    merged grey headers, checkboxes under Resolved/Absent/Aware, borders, widths."""
+    whole_sheet = {"sheetId": sheet_id}
+    # Reset the whole tab first - ws.clear() wipes values but leaves last week's
+    # merges, grey fills, borders and checkboxes behind.
+    reqs = [
+        {"unmergeCells": {"range": whole_sheet}},
+        {"repeatCell": {"range": whole_sheet, "cell": {"userEnteredFormat": {}},
+                        "fields": "userEnteredFormat"}},
+        {"setDataValidation": {"range": whole_sheet}},
+    ]
+    for width, start, end in ((190, 0, 1), (90, 1, 2), (330, 2, 3), (70, 3, 6)):
+        reqs.append({"updateDimensionProperties": {
+            "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
+                      "startIndex": start, "endIndex": end},
+            "properties": {"pixelSize": width}, "fields": "pixelSize"}})
+    for r in header_rows:
+        row_range = {"sheetId": sheet_id, "startRowIndex": r, "endRowIndex": r + 1,
+                     "startColumnIndex": 0, "endColumnIndex": 6}
+        reqs += [
+            {"mergeCells": {"range": dict(row_range, endColumnIndex=3), "mergeType": "MERGE_ROWS"}},
+            {"repeatCell": {"range": row_range,
+                            "cell": {"userEnteredFormat": {
+                                "backgroundColor": HEADER_GREY,
+                                "horizontalAlignment": "CENTER",
+                                "textFormat": {"bold": True}}},
+                            "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat)"}},
+        ]
+    for start, end in student_spans:
+        block = {"sheetId": sheet_id, "startRowIndex": start, "endRowIndex": end + 1,
+                 "startColumnIndex": 0, "endColumnIndex": 6}
+        reqs += [
+            {"setDataValidation": {"range": dict(block, startColumnIndex=3, endColumnIndex=6),
+                                   "rule": {"condition": {"type": "BOOLEAN"}, "showCustomUi": True}}},
+            {"repeatCell": {"range": dict(block, startColumnIndex=3, endColumnIndex=6),
+                            "cell": {"userEnteredFormat": {"horizontalAlignment": "CENTER"}},
+                            "fields": "userEnteredFormat.horizontalAlignment"}},
+        ]
+    for r in header_rows:
+        outline = {"sheetId": sheet_id, "startRowIndex": r, "endRowIndex": r + 1,
+                   "startColumnIndex": 0, "endColumnIndex": 6}
+        reqs.append({"updateBorders": {"range": outline,
+                                       "top": {"style": "SOLID"}, "bottom": {"style": "SOLID"},
+                                       "left": {"style": "SOLID"}, "right": {"style": "SOLID"},
+                                       "innerVertical": {"style": "SOLID"}}})
+    for start, end in student_spans:
+        block = {"sheetId": sheet_id, "startRowIndex": start, "endRowIndex": end + 1,
+                 "startColumnIndex": 0, "endColumnIndex": 6}
+        reqs.append({"updateBorders": {"range": block,
+                                       "top": {"style": "SOLID"}, "bottom": {"style": "SOLID"},
+                                       "left": {"style": "SOLID"}, "right": {"style": "SOLID"},
+                                       "innerHorizontal": {"style": "SOLID"},
+                                       "innerVertical": {"style": "SOLID"}}})
+    return reqs
+
+
+def _get_or_create_worksheet(ss, title, rows, cols):
+    try:
+        ws = ss.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        return ss.add_worksheet(title=title, rows=max(rows, 100), cols=max(cols, 8))
+    if ws.row_count < rows or ws.col_count < cols:
+        ws.resize(rows=max(rows, ws.row_count), cols=max(cols, ws.col_count))
+    return ws
+
+
+def export_day_tabs(ss, df):
+    """One tab per weekday that has students, laid out for printing. Returns the
+    tab names written."""
+    written, requests = [], []
+    for code, title in DAY_TAB_NAMES.items():
+        values, header_rows, student_spans = build_day_blocks(df, code)
+        if not values:
+            continue
+        ws = _get_or_create_worksheet(ss, title, len(values) + 20, 8)
+        ws.clear()
+        ws.update(range_name="A1", values=values)
+        requests += _day_tab_requests(ws.id, values, header_rows, student_spans)
+        written.append(title)
+    if requests:
+        ss.batch_update({"requests": requests})
+    return written
+
+
 def export_to_google_sheets(df):
     if "gcp_service_account" not in st.secrets:
         st.error("Secrets not found!")
-        return None
+        return None, []
     creds_dict = st.secrets["gcp_service_account"]
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -462,7 +577,7 @@ def export_to_google_sheets(df):
         ss = client.open(GOOGLE_SHEET_NAME)
     except Exception as e:
         st.error(f"Could not open sheet. Error: {e}")
-        return None
+        return None, []
     export_df = df[["Student Name", "Group", "Class Name", "Status"]]
     try:
         ws = ss.worksheet("Rank Up Flags")
@@ -472,11 +587,12 @@ def export_to_google_sheets(df):
     data_matrix = [export_df.columns.values.tolist()] + export_df.values.tolist()
     ws.update(range_name="A1", values=data_matrix)
     ws.format("A1:D1", {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}})
-    return f"https://docs.google.com/spreadsheets/d/{ss.id}"
+    tabs = export_day_tabs(ss, df)
+    return f"https://docs.google.com/spreadsheets/d/{ss.id}", tabs
 
 
-st.set_page_config(page_title="Ninja Rank Up Processor 5.2", page_icon="star", layout="wide")
-st.title("Ninja Rank Up Processor 5.2")
+st.set_page_config(page_title="Ninja Rank Up Processor 5.3", page_icon="star", layout="wide")
+st.title("Ninja Rank Up Processor 5.3")
 st.write("Upload the three iClassPro reports to flag students who are ready to rank up or falling behind. "
          "The attendance CSV is optional but sharpens the sign-off flag.")
 c1, c2, c3, c4 = st.columns(4)
@@ -529,9 +645,10 @@ if file_roll and file_list and file_eval:
                            f"{stale} with no skill updates, {gone} not attending.")
                 st.dataframe(final_df[["Student Name", "Group", "Class Name", "Status"]], use_container_width=True)
                 if st.button("Update Master Google Sheet", use_container_width=True):
-                    link = export_to_google_sheets(final_df)
+                    link, tabs = export_to_google_sheets(final_df)
                     if link:
-                        st.success("Google Sheet Updated Successfully!")
+                        st.success("Google Sheet updated - Rank Up Flags plus "
+                                   + ", ".join(tabs) + ".")
                         style = "background-color:#0083B8;color:white;padding:10px;text-decoration:none;border-radius:5px;display:inline-block;"
                         st.markdown(f'<a href="{link}" target="_blank" style="{style}">OPEN GOOGLE SHEET</a>', unsafe_allow_html=True)
         except Exception as e:
