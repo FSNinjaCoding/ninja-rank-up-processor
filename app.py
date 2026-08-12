@@ -52,12 +52,16 @@ DAY_TAB_NAMES = {"Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday",
                  "Thu": "Thursday", "Fri": "Friday", "Sat": "Saturday", "Sun": "Sunday"}
 CHECK_COLUMNS = ["Resolved", "Absent", "Aware"]
 PRIOR_ABSENCE_LABEL = "Prev. Absent"
+
+# Pasted straight from iClassPro, one student per line. Reported last on the row.
+NO_PHOTO_LABEL = "No Photo"
 HEADER_GREY = {"red": 0.85, "green": 0.85, "blue": 0.85}
 
 # Row ordering inside a single class time slot.
 PRIORITY_COMPLETE = 0
 PRIORITY_ONE_AWAY = 1
 PRIORITY_STRUGGLING = 2
+PRIORITY_NO_PHOTO = 3
 
 
 CELL_SCORE_DATE_RE = re.compile(r'(?P<score>\d)\s+(?P<date>\d{4}-\d{2}-\d{2})')
@@ -157,6 +161,14 @@ def is_skill_incomplete(score_text):
     if any(mark in text for mark in ["pass", "complete"]):
         return False
     return True
+
+
+def parse_pasted_names(text):
+    """A pasted list of students, one per line, run through the same name cleanup as
+    every report so 'Smith, Jane' and 'Jane Smith' both land on the same student."""
+    if not text:
+        return set()
+    return {clean_name(line) for line in str(text).splitlines() if clean_name(line)}
 
 
 def parse_attendance_csv(file_obj):
@@ -469,9 +481,10 @@ def evaluate_progress_status(signoff_info, attended, window_start, has_attendanc
 
 def build_results(df_roll, df_list, evals_dict, signoff_dict=None, report_date=None,
                   attendance_map=None, window_start=None, absence_map=None,
-                  window_end=None):
+                  window_end=None, no_photo=None):
     signoff_dict = signoff_dict or {}
     absence_map = absence_map or {}
+    no_photo = no_photo or set()
     report_date = report_date or date.today()
     # "Week prior" is the last 7 days of the attendance window, which covers one
     # occurrence of a weekly class however far into the week the report is pulled.
@@ -499,16 +512,18 @@ def build_results(df_roll, df_list, evals_dict, signoff_dict=None, report_date=N
         attended = attendance_map.get(s_name, []) if attendance_map is not None else []
         sign_status, sign_priority, days_over = evaluate_progress_status(
             signoff_dict.get(s_name), attended, window_start, attendance_map is not None)
-        if not rank_status and not att_status and not sign_status:
+        photo_status = NO_PHOTO_LABEL if s_name in no_photo else None
+        if not rank_status and not att_status and not sign_status and not photo_status:
             continue
         if REQUIRE_CLASS and class_name == "Unknown Class":
             continue
 
         # One row per student. Flags read in fixed order: overdue stage, stale skills,
-        # then the rank-up note (stage complete, or one skill away).
-        status = " | ".join(p for p in (att_status, sign_status, rank_status) if p)
+        # the rank-up note (stage complete, or one skill away), then missing photo.
+        status = " | ".join(p for p in (att_status, sign_status, rank_status, photo_status) if p)
         priority = rank_priority if rank_priority is not None else (
-            sign_priority if sign_priority is not None else PRIORITY_STRUGGLING)
+            sign_priority if sign_priority is not None else
+            (PRIORITY_NO_PHOTO if not att_status else PRIORITY_STRUGGLING))
         age_str = f" ({age})" if age else ""
         day, day_num, sort_time, time_str = parse_class_info(class_name)
         results.append({"Student Name": f"{s_name}{age_str}", "Group": group,
@@ -743,10 +758,9 @@ def show_howto(key):
             st.markdown(body)
 
 
-st.set_page_config(page_title="Ninja Rank Up Processor 5.9", page_icon="star", layout="wide")
-st.title("Ninja Rank Up Processor 5.9")
-st.write("Upload the three iClassPro reports to flag students who are ready to rank up or falling behind. "
-         "The attendance CSV is optional but sharpens the sign-off flag.")
+st.set_page_config(page_title="Ninja Rank Up Processor 6.0", page_icon="star", layout="wide")
+st.title("Ninja Rank Up Processor 6.0")
+st.write("Upload the iClassPro reports to flag students who are ready to rank up or falling behind.")
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     file_roll = st.file_uploader("1. Roll Sheet", type=['html', 'htm'])
@@ -758,7 +772,7 @@ with c3:
     file_eval = st.file_uploader("3. Skill Evaluation", type=['html', 'htm'])
     show_howto("eval")
 with c4:
-    file_att = st.file_uploader("4. Attendance CSV (optional)", type=['csv'])
+    file_att = st.file_uploader("4. Attendance CSV", type=['csv'])
     show_howto("attendance")
 
 def read_upload(uploaded):
@@ -768,6 +782,10 @@ def read_upload(uploaded):
     uploaded.seek(0)
     return uploaded.read()
 
+
+photo_text = st.text_area(
+    "Students missing a profile photo - paste one name per line (optional)",
+    height=110, placeholder="Baylor Treme\nBrooks Owen\nEaston Earp")
 
 if file_roll and file_list and file_eval:
     content_roll = read_upload(file_roll).decode("utf-8", errors='ignore')
@@ -797,9 +815,17 @@ if file_roll and file_list and file_eval:
                                "checked over the last 30 days without attendance context.")
                     attendance, class_attendance, absences, window_start = None, {}, {}, None
             df_roll = resolve_student_classes(df_roll_raw, class_attendance)
+            no_photo = parse_pasted_names(photo_text)
             final_df = build_results(df_roll, df_list, evals_dict, signoff_dict,
                                      report_date, attendance, window_start,
-                                     absences, window_end)
+                                     absences, window_end, no_photo)
+            if no_photo:
+                # A pasted name that matches nobody would silently do nothing, so say so
+                # rather than let the manager assume the student was flagged.
+                known = set(df_roll["Student Name"]) | set(df_list["Student Name"])
+                missing = sorted(n for n in no_photo if n not in known)
+                if missing:
+                    st.warning("No student found for: " + ", ".join(missing))
             if final_df.empty:
                 st.warning("No students met the criteria to rank up.")
             else:
