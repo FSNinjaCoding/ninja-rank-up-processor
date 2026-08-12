@@ -20,6 +20,11 @@ DAY_ORDER = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 
 # Key 0 covers students who have not passed any stage yet.
 ATTENDANCE_THRESHOLDS = {0: 12, 1: 12, 2: 16, 3: 20, 4: 24, 5: 28, 6: 32, 7: 36, 8: 40, 9: 44, 10: 48}
 
+# A student needs at least this many classes inside the window before a missing skill
+# update counts as a problem - one class is not enough to expect a coach to have
+# evaluated them.
+MIN_CLASSES_FOR_UPDATE_FLAG = 2
+
 # How far back a skill mark has to fall to count as recent. The attendance CSV's own
 # date range defines the window; without it, this many days back from the eval report.
 SIGNOFF_WINDOW_DAYS = 30
@@ -435,9 +440,11 @@ def evaluate_progress_status(last_passed, signoff_info, attended, window_start, 
     they were even here: a student who attended is not getting evaluated, a student
     who did not attend has stopped coming.
 
-    Exception: a student who has never passed a stage AND has not attended is a signup
-    that never got going, not a student who stalled - they are left off the report
-    entirely. Returns (status_text, priority, severity).
+    Two exceptions: a student who has never passed a stage AND has not attended is a
+    signup that never got going rather than a student who stalled, and a student who
+    made it to fewer than MIN_CLASSES_FOR_UPDATE_FLAG classes has not been here enough
+    to expect an evaluation. Both are left off the report entirely.
+    Returns (status_text, priority, severity).
     """
     last_mark = signoff_info.get('last_mark') if signoff_info else None
     if last_mark and last_mark >= window_start:
@@ -447,6 +454,8 @@ def evaluate_progress_status(last_passed, signoff_info, attended, window_start, 
             return None, None, 0
         return "No attendance in last 30 days", PRIORITY_NO_ATTENDANCE, 0
     classes = len(attended) if attended else 0
+    if has_attendance_data and classes < MIN_CLASSES_FOR_UPDATE_FLAG:
+        return None, None, 0
     label = "class" if classes == 1 else "classes"
     note = f" ({classes} {label} attended)" if classes else ""
     return f"No skill updates in last 30 days{note}", PRIORITY_STRUGGLING, classes
@@ -712,8 +721,8 @@ def show_howto(key):
             st.markdown(body)
 
 
-st.set_page_config(page_title="Ninja Rank Up Processor 5.6", page_icon="star", layout="wide")
-st.title("Ninja Rank Up Processor 5.6")
+st.set_page_config(page_title="Ninja Rank Up Processor 5.7", page_icon="star", layout="wide")
+st.title("Ninja Rank Up Processor 5.7")
 st.write("Upload the three iClassPro reports to flag students who are ready to rank up or falling behind. "
          "The attendance CSV is optional but sharpens the sign-off flag.")
 c1, c2, c3, c4 = st.columns(4)
