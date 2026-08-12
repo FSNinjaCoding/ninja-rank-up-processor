@@ -657,19 +657,78 @@ def export_to_google_sheets(df):
     return link, tabs, None
 
 
-st.set_page_config(page_title="Ninja Rank Up Processor 5.5", page_icon="star", layout="wide")
-st.title("Ninja Rank Up Processor 5.5")
+REPORT_HOWTO = {
+    "roll": ("Roll Sheet", [
+        "Reports (top bar)",
+        "Classes (side bar)",
+        "CLA-4 Roll Sheets",
+        "Group Processor preset",
+        "Start / End Date = Mon-Fri of the current week",
+        "HTML button at the bottom",
+        'Open the HTML page, right click, "Save as" (keep the default name)',
+    ]),
+    "list": ("Student List", [
+        "Reports (top bar)",
+        "Students (side bar)",
+        "Custom Student List",
+        "Group Processor preset",
+        "Date = today",
+        "HTML button at the bottom",
+        'Open the HTML page, right click, "Save as" (keep the default name)',
+    ]),
+    "eval": ("Skill Evaluation", [
+        "Classes (top bar)",
+        "Smart Filters: Rank up processor",
+        "Select all classes",
+        "Generate Report (page icon at the bottom)",
+        "Class Evaluation Forms",
+        "HTML button at the bottom",
+        'Open the HTML page, right click, "Save as" (keep the default name)',
+    ]),
+    "attendance": ("Attendance", [
+        "Students (top bar)",
+        "Smart Filters: Rank up processor",
+        "Select all students",
+        "Generate Report (page icon at the bottom)",
+        "Student Attendance Report",
+        "Start Date = 30 days before today, End Date = today",
+        "CSV button at the bottom",
+        "Download CSV",
+    ]),
+}
+
+
+def show_howto(key):
+    """A click-to-open cheat sheet under each uploader. st.popover needs a recent
+    Streamlit, so fall back to an expander rather than breaking the upload screen."""
+    title, steps = REPORT_HOWTO[key]
+    body = f"**{title} - where to find it in iClassPro**\n\n" + "\n".join(
+        f"{i}. {step}" for i, step in enumerate(steps, 1))
+    try:
+        with st.popover("How to pull this report"):
+            st.markdown(body)
+    except AttributeError:
+        with st.expander("How to pull this report"):
+            st.markdown(body)
+
+
+st.set_page_config(page_title="Ninja Rank Up Processor 5.6", page_icon="star", layout="wide")
+st.title("Ninja Rank Up Processor 5.6")
 st.write("Upload the three iClassPro reports to flag students who are ready to rank up or falling behind. "
          "The attendance CSV is optional but sharpens the sign-off flag.")
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     file_roll = st.file_uploader("1. Roll Sheet", type=['html', 'htm'])
+    show_howto("roll")
 with c2:
     file_list = st.file_uploader("2. Student List", type=['html', 'htm'])
+    show_howto("list")
 with c3:
     file_eval = st.file_uploader("3. Skill Evaluation", type=['html', 'htm'])
+    show_howto("eval")
 with c4:
     file_att = st.file_uploader("4. Attendance CSV (optional)", type=['csv'])
+    show_howto("attendance")
 
 def read_upload(uploaded):
     """Streamlit hands back the same file object on every rerun - and clicking a button
