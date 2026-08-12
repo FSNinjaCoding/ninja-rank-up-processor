@@ -480,18 +480,22 @@ def build_day_blocks(df, day_code):
     return values, header_rows, student_spans
 
 
-def _day_tab_requests(sheet_id, values, header_rows, student_spans):
-    """Formatting for one weekday tab, as Sheets API requests: reset old formatting,
-    merged grey headers, checkboxes under Resolved/Absent/Aware, borders, widths."""
+def _reset_requests(sheet_id):
+    """ws.clear() wipes values but leaves last week's merges, grey fills, borders and
+    checkboxes behind, so the tab has to be reset properly before it is rewritten."""
     whole_sheet = {"sheetId": sheet_id}
-    # Reset the whole tab first - ws.clear() wipes values but leaves last week's
-    # merges, grey fills, borders and checkboxes behind.
-    reqs = [
+    return [
         {"unmergeCells": {"range": whole_sheet}},
         {"repeatCell": {"range": whole_sheet, "cell": {"userEnteredFormat": {}},
                         "fields": "userEnteredFormat"}},
         {"setDataValidation": {"range": whole_sheet}},
     ]
+
+
+def _day_tab_requests(sheet_id, values, header_rows, student_spans):
+    """Formatting for one weekday tab, as Sheets API requests: reset old formatting,
+    merged grey headers, checkboxes under Resolved/Absent/Aware, borders, widths."""
+    reqs = []
     for width, start, end in ((190, 0, 1), (90, 1, 2), (330, 2, 3), (70, 3, 6)):
         reqs.append({"updateDimensionProperties": {
             "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
@@ -556,6 +560,13 @@ def export_day_tabs(ss, df):
         if not values:
             continue
         ws = _get_or_create_worksheet(ss, title, len(values) + 20, 8)
+        # Reset merges/fills/borders/checkboxes from last week. Sent on its own because
+        # unmergeCells errors on a tab that has no merges yet - a brand new tab, or one
+        # that was rebuilt without them - and that must not take the rest down with it.
+        try:
+            ss.batch_update({"requests": _reset_requests(ws.id)})
+        except Exception:
+            pass
         ws.clear()
         ws.update(range_name="A1", values=values)
         requests += _day_tab_requests(ws.id, values, header_rows, student_spans)
@@ -568,7 +579,7 @@ def export_day_tabs(ss, df):
 def export_to_google_sheets(df):
     if "gcp_service_account" not in st.secrets:
         st.error("Secrets not found!")
-        return None, []
+        return None, [], None
     creds_dict = st.secrets["gcp_service_account"]
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -577,7 +588,7 @@ def export_to_google_sheets(df):
         ss = client.open(GOOGLE_SHEET_NAME)
     except Exception as e:
         st.error(f"Could not open sheet. Error: {e}")
-        return None, []
+        return None, [], None
     export_df = df[["Student Name", "Group", "Class Name", "Status"]]
     try:
         ws = ss.worksheet("Rank Up Flags")
@@ -587,12 +598,18 @@ def export_to_google_sheets(df):
     data_matrix = [export_df.columns.values.tolist()] + export_df.values.tolist()
     ws.update(range_name="A1", values=data_matrix)
     ws.format("A1:D1", {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}})
-    tabs = export_day_tabs(ss, df)
-    return f"https://docs.google.com/spreadsheets/d/{ss.id}", tabs
+    link = f"https://docs.google.com/spreadsheets/d/{ss.id}"
+    # The main tab is already saved at this point. If the day tabs blow up, say so and
+    # still hand back the link rather than losing the whole run to an exception.
+    try:
+        tabs = export_day_tabs(ss, df)
+    except Exception as e:
+        return link, [], f"Main tab updated, but the day tabs failed: {e}"
+    return link, tabs, None
 
 
-st.set_page_config(page_title="Ninja Rank Up Processor 5.3", page_icon="star", layout="wide")
-st.title("Ninja Rank Up Processor 5.3")
+st.set_page_config(page_title="Ninja Rank Up Processor 5.4", page_icon="star", layout="wide")
+st.title("Ninja Rank Up Processor 5.4")
 st.write("Upload the three iClassPro reports to flag students who are ready to rank up or falling behind. "
          "The attendance CSV is optional but sharpens the sign-off flag.")
 c1, c2, c3, c4 = st.columns(4)
@@ -605,10 +622,18 @@ with c3:
 with c4:
     file_att = st.file_uploader("4. Attendance CSV (optional)", type=['csv'])
 
+def read_upload(uploaded):
+    """Streamlit hands back the same file object on every rerun - and clicking a button
+    is a rerun. Without the rewind the second read returns nothing, the parse comes back
+    empty, and the export silently has no data to write."""
+    uploaded.seek(0)
+    return uploaded.read()
+
+
 if file_roll and file_list and file_eval:
-    content_roll = file_roll.read().decode("utf-8", errors='ignore')
-    content_list = file_list.read().decode("utf-8", errors='ignore')
-    content_eval = file_eval.read().decode("utf-8", errors='ignore')
+    content_roll = read_upload(file_roll).decode("utf-8", errors='ignore')
+    content_list = read_upload(file_list).decode("utf-8", errors='ignore')
+    content_eval = read_upload(file_eval).decode("utf-8", errors='ignore')
     st.divider()
     with st.spinner('Parsing and Cross-Referencing Stages...'):
         try:
@@ -618,9 +643,11 @@ if file_roll and file_list and file_eval:
             report_date = parse_report_date(content_eval)
             attendance, window_start, window_end = None, None, None
             if file_att is not None:
+                file_att.seek(0)
                 attendance, window_start, window_end = parse_attendance_csv(file_att)
                 if not attendance:
-                    st.warning("Could not read the attendance CSV - falling back to day-based sign-off windows.")
+                    st.warning("Could not read the attendance CSV - skill updates will be "
+                               "checked over the last 30 days without attendance context.")
                     attendance, window_start = None, None
             final_df = build_results(df_roll, df_list, evals_dict, signoff_dict,
                                      report_date, attendance, window_start)
@@ -645,10 +672,18 @@ if file_roll and file_list and file_eval:
                            f"{stale} with no skill updates, {gone} not attending.")
                 st.dataframe(final_df[["Student Name", "Group", "Class Name", "Status"]], use_container_width=True)
                 if st.button("Update Master Google Sheet", use_container_width=True):
-                    link, tabs = export_to_google_sheets(final_df)
+                    link, tabs, warning = export_to_google_sheets(final_df)
                     if link:
-                        st.success("Google Sheet updated - Rank Up Flags plus "
-                                   + ", ".join(tabs) + ".")
+                        st.session_state["sheet_link"] = link
+                        written = ", ".join(tabs) if tabs else "no day tabs"
+                        st.success(f"Google Sheet updated - Rank Up Flags plus {written}.")
+                    if warning:
+                        st.warning(warning)
+                if st.session_state.get("sheet_link"):
+                    link = st.session_state["sheet_link"]
+                    try:
+                        st.link_button("OPEN GOOGLE SHEET", link, use_container_width=True)
+                    except AttributeError:
                         style = "background-color:#0083B8;color:white;padding:10px;text-decoration:none;border-radius:5px;display:inline-block;"
                         st.markdown(f'<a href="{link}" target="_blank" style="{style}">OPEN GOOGLE SHEET</a>', unsafe_allow_html=True)
         except Exception as e:
