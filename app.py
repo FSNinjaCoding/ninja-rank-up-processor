@@ -25,6 +25,9 @@ ATTENDANCE_THRESHOLDS = {0: 12, 1: 12, 2: 16, 3: 20, 4: 24, 5: 28, 6: 32, 7: 36,
 # evaluated them.
 MIN_CLASSES_FOR_UPDATE_FLAG = 2
 
+# How far back "the week prior" reaches when marking the absence column on day tabs.
+PRIOR_WEEK_DAYS = 7
+
 # How far back a skill mark has to fall to count as recent. The attendance CSV's own
 # date range defines the window; without it, this many days back from the eval report.
 SIGNOFF_WINDOW_DAYS = 30
@@ -54,7 +57,6 @@ HEADER_GREY = {"red": 0.85, "green": 0.85, "blue": 0.85}
 PRIORITY_COMPLETE = 0
 PRIORITY_ONE_AWAY = 1
 PRIORITY_STRUGGLING = 2
-PRIORITY_NO_ATTENDANCE = 3
 
 
 CELL_SCORE_DATE_RE = re.compile(r'(?P<score>\d)\s+(?P<date>\d{4}-\d{2}-\d{2})')
@@ -160,7 +162,7 @@ def parse_attendance_csv(file_obj):
     """iClassPro's Student Attendance Report: Student, Date, Timeslot, Event Name,
     Status, Excused - one row per student per class occurrence. Returns
     ({student: [dates present]}, {student: {class: (times present, last date)}},
-    window_start, window_end). 'Present (left early)' counts as present; absences are
+    {student: [dates absent]}, window_start, window_end). 'Present (left early)' counts as present; absences are
     ignored. The per-class counts are what decide a student's home class when they
     show up on more than one roster."""
     df = pd.read_csv(file_obj, encoding='utf-8-sig')
@@ -170,12 +172,17 @@ def parse_attendance_csv(file_obj):
     status_col = cols.get('status')
     event_col = cols.get('event name')
     if not (name_col and date_col and status_col):
-        return {}, {}, None, None
-    df = df[df[status_col].astype(str).str.strip().str.lower().str.startswith('present')].copy()
+        return {}, {}, {}, None, None
+    df = df.copy()
     df['_date'] = pd.to_datetime(df[date_col], format='%m/%d/%Y', errors='coerce').dt.date
     df = df[df['_date'].notna()]
     if df.empty:
-        return {}, {}, None, None
+        return {}, {}, {}, None, None
+    df['_status'] = df[status_col].astype(str).str.strip().str.lower()
+    absent_rows = df[df['_status'].str.startswith('absent')].copy()
+    df = df[df['_status'].str.startswith('present')].copy()
+    if df.empty:
+        return {}, {}, {}, None, None
     df['_name'] = df[name_col].map(clean_name)
     attended = {n: sorted(g['_date']) for n, g in df.groupby('_name')}
     by_class = {}
@@ -183,7 +190,9 @@ def parse_attendance_csv(file_obj):
         df['_class'] = df[event_col].map(abbreviate_class_name)
         for (n, c), g in df.groupby(['_name', '_class']):
             by_class.setdefault(n, {})[c] = (len(g), max(g['_date']))
-    return attended, by_class, df['_date'].min(), df['_date'].max()
+    absent_rows['_name'] = absent_rows[name_col].map(clean_name)
+    absences = {n: sorted(g['_date']) for n, g in absent_rows.groupby('_name')}
+    return attended, by_class, absences, df['_date'].min(), df['_date'].max()
 
 
 def is_skill_class(class_name):
@@ -428,43 +437,44 @@ def evaluate_attendance_status(last_passed, attendance):
     if threshold is None or attendance is None:
         return None, 0
     if attendance > threshold:
-        label = "class" if attendance == 1 else "classes"
-        stage_label = f"Stage {last_passed}" if last_passed else "starting"
-        return f"Overdue - {attendance} {label} since {stage_label}", attendance - threshold
+        over = attendance - threshold
+        label = "class" if over == 1 else "classes"
+        stage_label = f"S{last_passed}" if last_passed else "No Stage"
+        return f"{stage_label} +{over} {label} over (Goal = {threshold})", over
     return None, 0
 
 
-def evaluate_progress_status(last_passed, signoff_info, attended, window_start, has_attendance_data):
+def evaluate_progress_status(signoff_info, attended, window_start, has_attendance_data):
     """Every student, every stage, same test: was any skill marked - a 1, 2 or 3 -
     inside the window? If yes, nothing to flag. If no, the flag depends on whether
     they were even here: a student who attended is not getting evaluated, a student
     who did not attend has stopped coming.
 
-    Two exceptions: a student who has never passed a stage AND has not attended is a
-    signup that never got going rather than a student who stalled, and a student who
-    made it to fewer than MIN_CLASSES_FOR_UPDATE_FLAG classes has not been here enough
-    to expect an evaluation. Both are left off the report entirely.
+    A student with fewer than MIN_CLASSES_FOR_UPDATE_FLAG classes in the window is left
+    off entirely - too few classes to expect an evaluation, which also covers students
+    who stopped coming or never got going.
     Returns (status_text, priority, severity).
     """
     last_mark = signoff_info.get('last_mark') if signoff_info else None
     if last_mark and last_mark >= window_start:
         return None, None, 0
-    if has_attendance_data and not attended:
-        if not last_passed:
-            return None, None, 0
-        return "No attendance in last 30 days", PRIORITY_NO_ATTENDANCE, 0
     classes = len(attended) if attended else 0
     if has_attendance_data and classes < MIN_CLASSES_FOR_UPDATE_FLAG:
         return None, None, 0
     label = "class" if classes == 1 else "classes"
-    note = f" ({classes} {label} attended)" if classes else ""
-    return f"No skill updates in last 30 days{note}", PRIORITY_STRUGGLING, classes
+    note = f" ({classes} {label})" if classes else ""
+    return f"Last Skill {SIGNOFF_WINDOW_DAYS}+ days{note}", PRIORITY_STRUGGLING, classes
 
 
 def build_results(df_roll, df_list, evals_dict, signoff_dict=None, report_date=None,
-                  attendance_map=None, window_start=None):
+                  attendance_map=None, window_start=None, absence_map=None,
+                  window_end=None):
     signoff_dict = signoff_dict or {}
+    absence_map = absence_map or {}
     report_date = report_date or date.today()
+    # "Week prior" is the last 7 days of the attendance window, which covers one
+    # occurrence of a weekly class however far into the week the report is pulled.
+    recent_cutoff = (window_end or report_date) - timedelta(days=PRIOR_WEEK_DAYS - 1)
     if window_start is None:
         window_start = report_date - timedelta(days=SIGNOFF_WINDOW_DAYS)
     merged = pd.merge(df_roll, df_list, on="Student Name", how="outer")
@@ -487,7 +497,7 @@ def build_results(df_roll, df_list, evals_dict, signoff_dict=None, report_date=N
         att_status, att_over = evaluate_attendance_status(last_passed, attendance)
         attended = attendance_map.get(s_name, []) if attendance_map is not None else []
         sign_status, sign_priority, days_over = evaluate_progress_status(
-            last_passed, signoff_dict.get(s_name), attended, window_start, attendance_map is not None)
+            signoff_dict.get(s_name), attended, window_start, attendance_map is not None)
         if not rank_status and not att_status and not sign_status:
             continue
         if REQUIRE_CLASS and class_name == "Unknown Class":
@@ -503,6 +513,7 @@ def build_results(df_roll, df_list, evals_dict, signoff_dict=None, report_date=N
                         "Class Name": class_name, "Status": status,
                         "Sort Day": day, "Sort Day Num": day_num, "Sort Time": sort_time,
                         "Class Time": time_str,
+                        "Absent Prior Week": any(d >= recent_cutoff for d in absence_map.get(s_name, [])),
                         "Group Rank": GROUP_ORDER.get(group, GROUP_ORDER_DEFAULT),
                         "Priority": priority, "Days Over": days_over, "Over By": att_over})
     df = pd.DataFrame(results)
@@ -519,6 +530,8 @@ def build_results(df_roll, df_list, evals_dict, signoff_dict=None, report_date=N
 def build_day_blocks(df, day_code):
     """Lays out one weekday tab: a header row per class time (day + start time, with
     the three check-off columns), the students in that slot, then a blank spacer.
+    Column C is a checkbox ticked when the student missed their class in the week
+    prior - context for why nothing got signed off.
     Two classes running at the same time share one block, which is how the manager
     reads the floor. Returns (values, header_row_indexes, student_row_spans)."""
     day_df = df[df['Sort Day'] == day_code]
@@ -529,12 +542,14 @@ def build_day_blocks(df, day_code):
         time_str = str(block.iloc[0].get('Class Time') or "").strip()
         label = f"{DAY_TAB_NAMES.get(day_code, day_code)} {time_str}".strip()
         header_rows.append(len(values))
-        values.append([label, "", ""] + CHECK_COLUMNS)
+        values.append([label, "", "", ""] + CHECK_COLUMNS)
         first_student = len(values)
         for _, row in block.iterrows():
-            values.append([row['Student Name'], row['Group'], row['Status'], "", "", ""])
+            values.append([row['Student Name'], row['Group'],
+                           bool(row.get('Absent Prior Week', False)),
+                           row['Status'], "", "", ""])
         student_spans.append((first_student, len(values) - 1))
-        values.append(["", "", "", "", "", ""])
+        values.append(["", "", "", "", "", "", ""])
     return values, header_rows, student_spans
 
 
@@ -554,16 +569,16 @@ def _day_tab_requests(sheet_id, values, header_rows, student_spans):
     """Formatting for one weekday tab, as Sheets API requests: reset old formatting,
     merged grey headers, checkboxes under Resolved/Absent/Aware, borders, widths."""
     reqs = []
-    for width, start, end in ((190, 0, 1), (90, 1, 2), (330, 2, 3), (70, 3, 6)):
+    for width, start, end in ((190, 0, 1), (90, 1, 2), (60, 2, 3), (330, 3, 4), (70, 4, 7)):
         reqs.append({"updateDimensionProperties": {
             "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
                       "startIndex": start, "endIndex": end},
             "properties": {"pixelSize": width}, "fields": "pixelSize"}})
     for r in header_rows:
         row_range = {"sheetId": sheet_id, "startRowIndex": r, "endRowIndex": r + 1,
-                     "startColumnIndex": 0, "endColumnIndex": 6}
+                     "startColumnIndex": 0, "endColumnIndex": 7}
         reqs += [
-            {"mergeCells": {"range": dict(row_range, endColumnIndex=3), "mergeType": "MERGE_ROWS"}},
+            {"mergeCells": {"range": dict(row_range, endColumnIndex=4), "mergeType": "MERGE_ROWS"}},
             {"repeatCell": {"range": row_range,
                             "cell": {"userEnteredFormat": {
                                 "backgroundColor": HEADER_GREY,
@@ -573,24 +588,28 @@ def _day_tab_requests(sheet_id, values, header_rows, student_spans):
         ]
     for start, end in student_spans:
         block = {"sheetId": sheet_id, "startRowIndex": start, "endRowIndex": end + 1,
-                 "startColumnIndex": 0, "endColumnIndex": 6}
+                 "startColumnIndex": 0, "endColumnIndex": 7}
+        checks = dict(block, startColumnIndex=4, endColumnIndex=7)
+        absent_col = dict(block, startColumnIndex=2, endColumnIndex=3)
         reqs += [
-            {"setDataValidation": {"range": dict(block, startColumnIndex=3, endColumnIndex=6),
+            {"setDataValidation": {"range": checks,
                                    "rule": {"condition": {"type": "BOOLEAN"}, "showCustomUi": True}}},
-            {"repeatCell": {"range": dict(block, startColumnIndex=3, endColumnIndex=6),
+            {"setDataValidation": {"range": absent_col,
+                                   "rule": {"condition": {"type": "BOOLEAN"}, "showCustomUi": True}}},
+            {"repeatCell": {"range": dict(block, startColumnIndex=2, endColumnIndex=7),
                             "cell": {"userEnteredFormat": {"horizontalAlignment": "CENTER"}},
                             "fields": "userEnteredFormat.horizontalAlignment"}},
         ]
     for r in header_rows:
         outline = {"sheetId": sheet_id, "startRowIndex": r, "endRowIndex": r + 1,
-                   "startColumnIndex": 0, "endColumnIndex": 6}
+                   "startColumnIndex": 0, "endColumnIndex": 7}
         reqs.append({"updateBorders": {"range": outline,
                                        "top": {"style": "SOLID"}, "bottom": {"style": "SOLID"},
                                        "left": {"style": "SOLID"}, "right": {"style": "SOLID"},
                                        "innerVertical": {"style": "SOLID"}}})
     for start, end in student_spans:
         block = {"sheetId": sheet_id, "startRowIndex": start, "endRowIndex": end + 1,
-                 "startColumnIndex": 0, "endColumnIndex": 6}
+                 "startColumnIndex": 0, "endColumnIndex": 7}
         reqs.append({"updateBorders": {"range": block,
                                        "top": {"style": "SOLID"}, "bottom": {"style": "SOLID"},
                                        "left": {"style": "SOLID"}, "right": {"style": "SOLID"},
@@ -617,7 +636,7 @@ def export_day_tabs(ss, df):
         values, header_rows, student_spans = build_day_blocks(df, code)
         if not values:
             continue
-        ws = _get_or_create_worksheet(ss, title, len(values) + 20, 8)
+        ws = _get_or_create_worksheet(ss, title, len(values) + 20, 9)
         # Reset merges/fills/borders/checkboxes from last week. Sent on its own because
         # unmergeCells errors on a tab that has no merges yet - a brand new tab, or one
         # that was rebuilt without them - and that must not take the rest down with it.
@@ -721,8 +740,8 @@ def show_howto(key):
             st.markdown(body)
 
 
-st.set_page_config(page_title="Ninja Rank Up Processor 5.7", page_icon="star", layout="wide")
-st.title("Ninja Rank Up Processor 5.7")
+st.set_page_config(page_title="Ninja Rank Up Processor 5.8", page_icon="star", layout="wide")
+st.title("Ninja Rank Up Processor 5.8")
 st.write("Upload the three iClassPro reports to flag students who are ready to rank up or falling behind. "
          "The attendance CSV is optional but sharpens the sign-off flag.")
 c1, c2, c3, c4 = st.columns(4)
@@ -764,25 +783,27 @@ if file_roll and file_list and file_eval:
             df_list = parse_student_list(content_list)
             evals_dict, signoff_dict = parse_skill_evals_v5(content_eval)
             report_date = parse_report_date(content_eval)
-            attendance, class_attendance, window_start, window_end = None, {}, None, None
+            attendance, class_attendance, absences = None, {}, {}
+            window_start, window_end = None, None
             if file_att is not None:
                 file_att.seek(0)
-                attendance, class_attendance, window_start, window_end = parse_attendance_csv(file_att)
+                (attendance, class_attendance, absences,
+                 window_start, window_end) = parse_attendance_csv(file_att)
                 if not attendance:
                     st.warning("Could not read the attendance CSV - skill updates will be "
                                "checked over the last 30 days without attendance context.")
-                    attendance, class_attendance, window_start = None, {}, None
+                    attendance, class_attendance, absences, window_start = None, {}, {}, None
             df_roll = resolve_student_classes(df_roll_raw, class_attendance)
             final_df = build_results(df_roll, df_list, evals_dict, signoff_dict,
-                                     report_date, attendance, window_start)
+                                     report_date, attendance, window_start,
+                                     absences, window_end)
             if final_df.empty:
                 st.warning("No students met the criteria to rank up.")
             else:
                 ready = int((final_df['Priority'] == PRIORITY_COMPLETE).sum())
                 close = int((final_df['Priority'] == PRIORITY_ONE_AWAY).sum())
                 behind = int(final_df["Status"].str.contains("Overdue").sum())
-                stale = int(final_df["Status"].str.contains("No skill updates").sum())
-                gone = int(final_df["Status"].str.contains("No attendance").sum())
+                stale = int(final_df["Status"].str.contains("Last Skill").sum())
                 if window_start:
                     st.caption(f"Eval report date {report_date:%m/%d/%Y} - attendance window "
                                f"{window_start:%m/%d/%Y} to {window_end:%m/%d/%Y}, "
@@ -793,7 +814,7 @@ if file_roll and file_list and file_eval:
                                f"and attendance not checked.")
                 st.success(f"{len(final_df)} students flagged - {ready} stage complete, "
                            f"{close} one skill away, {behind} overdue on attendance, "
-                           f"{stale} with no skill updates, {gone} not attending.")
+                           f"{stale} with no recent skill update.")
                 st.dataframe(final_df[["Student Name", "Group", "Class Name", "Status"]], use_container_width=True)
                 if st.button("Update Master Google Sheet", use_container_width=True):
                     link, tabs, warning = export_to_google_sheets(final_df)
