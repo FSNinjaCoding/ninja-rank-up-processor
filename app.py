@@ -51,6 +51,7 @@ NON_SKILL_CLASS_PATTERNS = ("open gym", "makeup token", "legacy", "ninja team")
 DAY_TAB_NAMES = {"Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday",
                  "Thu": "Thursday", "Fri": "Friday", "Sat": "Saturday", "Sun": "Sunday"}
 CHECK_COLUMNS = ["Resolved", "Absent", "Aware"]
+PRIOR_ABSENCE_LABEL = "Prev. Absent"
 HEADER_GREY = {"red": 0.85, "green": 0.85, "blue": 0.85}
 
 # Row ordering inside a single class time slot.
@@ -439,8 +440,8 @@ def evaluate_attendance_status(last_passed, attendance):
     if attendance > threshold:
         over = attendance - threshold
         label = "class" if over == 1 else "classes"
-        stage_label = f"S{last_passed}" if last_passed else "No Stage"
-        return f"{stage_label} +{over} {label} over (Goal = {threshold})", over
+        stage_label = f"Stage {last_passed}" if last_passed else "No Stage"
+        return f"+{over} {label} over ({stage_label} Goal = {threshold})", over
     return None, 0
 
 
@@ -503,8 +504,9 @@ def build_results(df_roll, df_list, evals_dict, signoff_dict=None, report_date=N
         if REQUIRE_CLASS and class_name == "Unknown Class":
             continue
 
-        # One row per student; every flag that fires is joined into the one status.
-        status = " | ".join(p for p in (rank_status, att_status, sign_status) if p)
+        # One row per student. Flags read in fixed order: overdue stage, stale skills,
+        # then the rank-up note (stage complete, or one skill away).
+        status = " | ".join(p for p in (att_status, sign_status, rank_status) if p)
         priority = rank_priority if rank_priority is not None else (
             sign_priority if sign_priority is not None else PRIORITY_STRUGGLING)
         age_str = f" ({age})" if age else ""
@@ -530,8 +532,8 @@ def build_results(df_roll, df_list, evals_dict, signoff_dict=None, report_date=N
 def build_day_blocks(df, day_code):
     """Lays out one weekday tab: a header row per class time (day + start time, with
     the three check-off columns), the students in that slot, then a blank spacer.
-    Column C is a checkbox ticked when the student missed their class in the week
-    prior - context for why nothing got signed off.
+    Column C reads "Prev. Absent" when the student missed their class in the week
+    prior - context for why nothing got signed off - and is blank otherwise.
     Two classes running at the same time share one block, which is how the manager
     reads the floor. Returns (values, header_row_indexes, student_row_spans)."""
     day_df = df[df['Sort Day'] == day_code]
@@ -546,7 +548,7 @@ def build_day_blocks(df, day_code):
         first_student = len(values)
         for _, row in block.iterrows():
             values.append([row['Student Name'], row['Group'],
-                           bool(row.get('Absent Prior Week', False)),
+                           PRIOR_ABSENCE_LABEL if row.get('Absent Prior Week') else "",
                            row['Status'], "", "", ""])
         student_spans.append((first_student, len(values) - 1))
         values.append(["", "", "", "", "", "", ""])
@@ -569,7 +571,7 @@ def _day_tab_requests(sheet_id, values, header_rows, student_spans):
     """Formatting for one weekday tab, as Sheets API requests: reset old formatting,
     merged grey headers, checkboxes under Resolved/Absent/Aware, borders, widths."""
     reqs = []
-    for width, start, end in ((190, 0, 1), (90, 1, 2), (60, 2, 3), (330, 3, 4), (70, 4, 7)):
+    for width, start, end in ((190, 0, 1), (90, 1, 2), (95, 2, 3), (430, 3, 4), (70, 4, 7)):
         reqs.append({"updateDimensionProperties": {
             "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
                       "startIndex": start, "endIndex": end},
@@ -590,14 +592,15 @@ def _day_tab_requests(sheet_id, values, header_rows, student_spans):
         block = {"sheetId": sheet_id, "startRowIndex": start, "endRowIndex": end + 1,
                  "startColumnIndex": 0, "endColumnIndex": 7}
         checks = dict(block, startColumnIndex=4, endColumnIndex=7)
-        absent_col = dict(block, startColumnIndex=2, endColumnIndex=3)
         reqs += [
             {"setDataValidation": {"range": checks,
                                    "rule": {"condition": {"type": "BOOLEAN"}, "showCustomUi": True}}},
-            {"setDataValidation": {"range": absent_col,
-                                   "rule": {"condition": {"type": "BOOLEAN"}, "showCustomUi": True}}},
-            {"repeatCell": {"range": dict(block, startColumnIndex=2, endColumnIndex=7),
+            {"repeatCell": {"range": checks,
                             "cell": {"userEnteredFormat": {"horizontalAlignment": "CENTER"}},
+                            "fields": "userEnteredFormat.horizontalAlignment"}},
+            # Status can run long, so it reads left aligned like the name and group.
+            {"repeatCell": {"range": dict(block, startColumnIndex=0, endColumnIndex=4),
+                            "cell": {"userEnteredFormat": {"horizontalAlignment": "LEFT"}},
                             "fields": "userEnteredFormat.horizontalAlignment"}},
         ]
     for r in header_rows:
@@ -740,8 +743,8 @@ def show_howto(key):
             st.markdown(body)
 
 
-st.set_page_config(page_title="Ninja Rank Up Processor 5.8", page_icon="star", layout="wide")
-st.title("Ninja Rank Up Processor 5.8")
+st.set_page_config(page_title="Ninja Rank Up Processor 5.9", page_icon="star", layout="wide")
+st.title("Ninja Rank Up Processor 5.9")
 st.write("Upload the three iClassPro reports to flag students who are ready to rank up or falling behind. "
          "The attendance CSV is optional but sharpens the sign-off flag.")
 c1, c2, c3, c4 = st.columns(4)
